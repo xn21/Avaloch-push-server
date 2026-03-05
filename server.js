@@ -1,198 +1,158 @@
 // server.js
 // Avaloch Staff Push Notification Server
-// Deploy to Render (free tier) at: https://render.com
 
 const express = require("express");
 const apn     = require("apn");
-const https   = require("https");
+const fs      = require("fs");
 
-const app  = express();
+const app = express();
 app.use(express.json());
 
-// ── Config (set these as Render environment variables) ────────────────────────
+// ── Config ────────────────────────────────────────────────────────────────────
 const config = {
-  apnsKeyId:   process.env.APNS_KEY_ID    || "7CZNLB7NC4",
-  apnsTeamId:  process.env.APNS_TEAM_ID   || "8LH2QGPV85",
-  apnsKeyPath: process.env.APNS_KEY_PATH  || "./AuthKey_7CZNLB7NC4.p8",
-  apnsKeyContent: process.env.APNS_KEY,   // full key content as env var (preferred on Render)
-  bundleId:    process.env.BUNDLE_ID      || "com.avaloch.Avaloch-Staff",
-  production:  process.env.NODE_ENV === "production",
-  cloudKitToken: process.env.CLOUDKIT_SERVER_TOKEN,
-  cloudKitContainer: "iCloud.com.avaloch.staff",
-  cloudKitEnv: process.env.NODE_ENV === "production" ? "production" : "development",
+  apnsKeyId:  process.env.APNS_KEY_ID  || "YOUR_KEY_ID",
+  apnsTeamId: process.env.APNS_TEAM_ID || "8LH2QGPV85",
+  apnsKey:    process.env.APNS_KEY,
+  bundleId:   process.env.BUNDLE_ID    || "com.avaloch.Avaloch-Staff",
+  production: process.env.NODE_ENV === "production",
 };
 
-// ── APNs Provider ─────────────────────────────────────────────────────────────
-const apnProvider = new apn.Provider({
-  token: {
-    key:    config.apnsKeyContent || config.apnsKeyPath,
-    keyId:  config.apnsKeyId,
-    teamId: config.apnsTeamId,
-  },
-  production: config.production,
-});
+// ── Token Store ───────────────────────────────────────────────────────────────
+const TOKEN_FILE = "./tokens.json";
+let tokenStore = {};
 
-// ── CloudKit REST helper ──────────────────────────────────────────────────────
-// Fetches device tokens from CloudKit filtered by role(s)
-async function fetchDeviceTokens(roles) {
-  return new Promise((resolve, reject) => {
-    const filterFields = roles.map(role => ({
-      fieldName: "role",
-      comparator: "EQUALS",
-      fieldValue: { value: role, type: "STRING" }
-    }));
-
-    const body = JSON.stringify({
-      query: {
-        recordType: "DeviceToken",
-        filterBy: filterFields.length === 1
-          ? filterFields
-          : [{ fieldName: "role", comparator: "IN",
-               fieldValue: { value: roles, type: "STRING_LIST" } }]
-      },
-      zoneID: { zoneName: "_defaultZone" }
-    });
-
-    const options = {
-      hostname: "api.apple-cloudkit.com",
-      path: `/database/1/${config.cloudKitContainer}/${config.cloudKitEnv}/public/records/query`,
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Content-Length": Buffer.byteLength(body),
-        "X-CloudKit-AuthToken": config.cloudKitToken,
-      }
-    };
-
-    const req = https.request(options, (res) => {
-      let data = "";
-      res.on("data", chunk => data += chunk);
-      res.on("end", () => {
-        try {
-          const parsed = JSON.parse(data);
-          const tokens = (parsed.records || [])
-            .map(r => r.fields?.token?.value)
-            .filter(Boolean);
-          resolve(tokens);
-        } catch (e) {
-          reject(e);
-        }
-      });
-    });
-
-    req.on("error", reject);
-    req.write(body);
-    req.end();
-  });
+function loadTokens() {
+  try {
+    if (fs.existsSync(TOKEN_FILE)) {
+      tokenStore = JSON.parse(fs.readFileSync(TOKEN_FILE, "utf8"));
+      console.log(`[Tokens] Loaded ${Object.keys(tokenStore).length} tokens`);
+    }
+  } catch (e) {
+    console.warn("[Tokens] Could not load tokens:", e.message);
+  }
 }
 
-// All roles
+function saveTokens() {
+  try { fs.writeFileSync(TOKEN_FILE, JSON.stringify(tokenStore, null, 2)); }
+  catch (e) { console.warn("[Tokens] Could not save tokens:", e.message); }
+}
+
+loadTokens();
+
+// ── APNs Provider ─────────────────────────────────────────────────────────────
+let apnProvider = null;
+
+function getProvider() {
+  if (apnProvider) return apnProvider;
+  if (!config.apnsKey) { console.warn("[APNs] No APNS_KEY configured"); return null; }
+  try {
+    apnProvider = new apn.Provider({
+      token: { key: config.apnsKey, keyId: config.apnsKeyId, teamId: config.apnsTeamId },
+      production: config.production,
+    });
+    console.log("[APNs] Provider initialized");
+    return apnProvider;
+  } catch (e) {
+    console.error("[APNs] Init failed:", e.message);
+    return null;
+  }
+}
+
+// ── Send Helper ───────────────────────────────────────────────────────────────
+async function sendToRoles(roles, title, body, destination, excludeUserName = null) {
+  const provider = getProvider();
+  if (!provider) return { sent: 0, error: "No APNs provider" };
+
+  const tokens = Object.values(tokenStore)
+    .filter(t => roles.includes(t.role))
+    .filter(t => !excludeUserName || t.userName !== excludeUserName)
+    .map(t => t.token);
+
+  if (tokens.length === 0) {
+    console.log(`[APNs] No tokens for roles: ${roles.join(", ")}`);
+    return { sent: 0 };
+  }
+
+  const notification = new apn.Notification();
+  notification.expiry  = Math.floor(Date.now() / 1000) + 3600;
+  notification.badge   = 1;
+  notification.sound   = "default";
+  notification.alert   = { title, body };
+  notification.payload = { destination };
+  notification.topic   = config.bundleId;
+
+  const result = await provider.send(notification, tokens);
+  console.log(`[APNs] Sent: ${result.sent.length}, Failed: ${result.failed.length}`);
+
+  result.failed.forEach(f => {
+    const reason = f.response?.reason;
+    if (reason === "BadDeviceToken" || reason === "Unregistered") {
+      const entry = Object.entries(tokenStore).find(([, v]) => v.token === f.device);
+      if (entry) { delete tokenStore[entry[0]]; saveTokens(); }
+    }
+  });
+
+  return { sent: result.sent.length, failed: result.failed.length };
+}
+
 const ALL_ROLES = ["Management", "Front Desk", "Housekeeping", "Maintenance", "Food & Beverage"];
 
-// ── Send helper ───────────────────────────────────────────────────────────────
-async function sendToRoles(roles, title, body, destination, excludeToken = null) {
-  try {
-    const tokens = await fetchDeviceTokens(roles);
-    const filtered = excludeToken
-      ? tokens.filter(t => t !== excludeToken)
-      : tokens;
-
-    if (filtered.length === 0) {
-      console.log(`[APNs] No tokens found for roles: ${roles.join(", ")}`);
-      return { sent: 0 };
-    }
-
-    const notification = new apn.Notification();
-    notification.expiry      = Math.floor(Date.now() / 1000) + 3600; // 1hr TTL
-    notification.badge       = 1;
-    notification.sound       = "default";
-    notification.alert       = { title, body };
-    notification.payload     = { destination };
-    notification.topic       = config.bundleId;
-
-    const result = await apnProvider.send(notification, filtered);
-    console.log(`[APNs] Sent to ${result.sent.length} devices, failed: ${result.failed.length}`);
-
-    // Log any failures for debugging
-    result.failed.forEach(f => {
-      console.error(`[APNs] Failed token ${f.device}: ${f.error?.message || f.response?.reason}`);
-    });
-
-    return { sent: result.sent.length, failed: result.failed.length };
-  } catch (err) {
-    console.error("[APNs] Error:", err.message);
-    throw err;
-  }
-}
-
-// ── Routes ────────────────────────────────────────────────────────────────────
-
-// Health check
-app.get("/", (req, res) => {
-  res.json({ status: "Avaloch push server running", env: config.production ? "production" : "sandbox" });
+// ── Token Routes ──────────────────────────────────────────────────────────────
+app.post("/register", (req, res) => {
+  const { token, userName, role, deviceID } = req.body;
+  if (!token || !userName || !role || !deviceID)
+    return res.status(400).json({ error: "Missing fields" });
+  tokenStore[deviceID] = { token, userName, role, updatedAt: new Date().toISOString() };
+  saveTokens();
+  console.log(`[Tokens] Registered ${userName} (${role})`);
+  res.json({ success: true });
 });
 
-// 1. Bulletin posted → notify everyone
+app.post("/unregister", (req, res) => {
+  const { deviceID } = req.body;
+  if (deviceID && tokenStore[deviceID]) {
+    console.log(`[Tokens] Unregistered ${tokenStore[deviceID].userName}`);
+    delete tokenStore[deviceID];
+    saveTokens();
+  }
+  res.json({ success: true });
+});
+
+// ── Notification Routes ───────────────────────────────────────────────────────
+app.get("/", (req, res) => res.json({
+  status: "Avaloch push server running",
+  env: config.production ? "production" : "sandbox",
+  registeredDevices: Object.keys(tokenStore).length
+}));
+
 app.post("/notify/bulletin", async (req, res) => {
-  const { title, body, destination } = req.body;
-  try {
-    const result = await sendToRoles(ALL_ROLES, title, body, destination);
-    res.json({ success: true, ...result });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
+  try { res.json({ success: true, ...await sendToRoles(ALL_ROLES, req.body.title, req.body.body, req.body.destination) }); }
+  catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
-// 2. Staff chat message → notify everyone except sender
 app.post("/notify/chat", async (req, res) => {
-  const { title, body, destination, senderName } = req.body;
-  // We exclude by senderName match — fetch all tokens then filter by name
-  // For simplicity we send to all and let the app suppress if sender matches
-  try {
-    const result = await sendToRoles(ALL_ROLES, title, body, destination);
-    res.json({ success: true, ...result });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
+  try { res.json({ success: true, ...await sendToRoles(ALL_ROLES, req.body.title, req.body.body, req.body.destination, req.body.senderName) }); }
+  catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
-// 3. Guest message → Front Desk only
 app.post("/notify/guest-message", async (req, res) => {
-  const { title, body, destination } = req.body;
-  try {
-    const result = await sendToRoles(["Front Desk"], title, body, destination);
-    res.json({ success: true, ...result });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
+  try { res.json({ success: true, ...await sendToRoles(["Front Desk"], req.body.title, req.body.body, req.body.destination) }); }
+  catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
-// 4. Reorder request submitted → Management + Front Desk
 app.post("/notify/reorder", async (req, res) => {
-  const { title, body, destination } = req.body;
-  try {
-    const result = await sendToRoles(["Management", "Front Desk"], title, body, destination);
-    res.json({ success: true, ...result });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
+  try { res.json({ success: true, ...await sendToRoles(["Management", "Front Desk"], req.body.title, req.body.body, req.body.destination) }); }
+  catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
-// 5. Maintenance ticket created → Maintenance only
 app.post("/notify/maintenance", async (req, res) => {
-  const { title, body, destination } = req.body;
-  try {
-    const result = await sendToRoles(["Maintenance"], title, body, destination);
-    res.json({ success: true, ...result });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
+  try { res.json({ success: true, ...await sendToRoles(["Maintenance"], req.body.title, req.body.body, req.body.destination) }); }
+  catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Avaloch push server listening on port ${PORT}`);
-  console.log(`Environment: ${config.production ? "Production" : "Sandbox"}`);
-  console.log(`Bundle ID: ${config.bundleId}`);
+  console.log(`Avaloch push server on port ${PORT}`);
+  getProvider();
 });
