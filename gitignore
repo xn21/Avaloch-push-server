@@ -1,0 +1,4 @@
+node_modules/
+*.p8
+.env
+.DS_Store

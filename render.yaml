@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: avaloch-push-server
+    runtime: node
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: NODE_ENV
+        value: development        # change to "production" before App Store launch
+      - key: APNS_KEY_ID
+        value: 7CZNLB7NC4
+      - key: APNS_TEAM_ID
+        value: 8LH2QGPV85
+      - key: BUNDLE_ID
+        value: com.avaloch.Avaloch-Staff
+      - key: APNS_KEY
+        sync: false               # paste .p8 file contents here in Render dashboard
+      - key: CLOUDKIT_SERVER_TOKEN
+        sync: false               # paste CloudKit server-to-server token here
