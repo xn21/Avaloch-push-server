@@ -8,7 +8,6 @@
   },
   "dependencies": {
     "express": "^4.18.2",
-    "node-apn": "^5.1.3",
-    "@cloudkit-js/rest": "^0.0.1"
+    "node-apn": "^5.1.3"
   }
 }
