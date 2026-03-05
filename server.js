@@ -3,7 +3,7 @@
 // Deploy to Render (free tier) at: https://render.com
 
 const express = require("express");
-const apn     = require("node-apn");
+const apn     = require("apn");
 const https   = require("https");
 
 const app  = express();
