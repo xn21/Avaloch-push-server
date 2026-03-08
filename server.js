@@ -74,12 +74,13 @@ async function sendToRoles(roles, title, body, destination, excludeUserName = nu
   }
 
   const notification = new apn.Notification();
-  notification.expiry  = Math.floor(Date.now() / 1000) + 3600;
-  notification.badge   = 1;
-  notification.sound   = "default";
-  notification.alert   = { title, body };
-  notification.payload = { destination };
-  notification.topic   = config.bundleId;
+  notification.expiry          = Math.floor(Date.now() / 1000) + 3600;
+  notification.badge           = 1;
+  notification.sound           = "default";
+  notification.alert           = { title, body };
+  notification.payload         = { destination };
+  notification.topic           = config.bundleId;
+  notification.contentAvailable = 1; // silent background wake to trigger CloudKit refresh
 
   const result = await provider.send(notification, tokens);
   console.log(`[APNs] Sent: ${result.sent.length}, Failed: ${result.failed.length}`);
@@ -146,7 +147,7 @@ app.post("/notify/reorder", async (req, res) => {
 });
 
 app.post("/notify/maintenance", async (req, res) => {
-  try { res.json({ success: true, ...await sendToRoles(["Maintenance"], req.body.title, req.body.body, req.body.destination) }); }
+  try { res.json({ success: true, ...await sendToRoles(ALL_ROLES, req.body.title, req.body.body, req.body.destination) }); }
   catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
