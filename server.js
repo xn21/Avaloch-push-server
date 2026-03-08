@@ -59,13 +59,12 @@ function getProvider() {
 }
 
 // ── Send Helper ───────────────────────────────────────────────────────────────
-async function sendToRoles(roles, title, body, destination, excludeUserName = null) {
+async function sendToRoles(roles, title, body, destination) {
   const provider = getProvider();
   if (!provider) return { sent: 0, error: "No APNs provider" };
 
   const tokens = Object.values(tokenStore)
     .filter(t => roles.includes(t.role))
-    .filter(t => !excludeUserName || t.userName !== excludeUserName)
     .map(t => t.token);
 
   if (tokens.length === 0) {
@@ -132,7 +131,7 @@ app.post("/notify/bulletin", async (req, res) => {
 });
 
 app.post("/notify/chat", async (req, res) => {
-  try { res.json({ success: true, ...await sendToRoles(ALL_ROLES, req.body.title, req.body.body, req.body.destination, req.body.senderName) }); }
+  try { res.json({ success: true, ...await sendToRoles(ALL_ROLES, req.body.title, req.body.body, req.body.destination) }); }
   catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
