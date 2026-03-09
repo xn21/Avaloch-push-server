@@ -154,6 +154,95 @@ app.post("/notify/maintenance", async (req, res) => {
   catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
+// ── StayNTouch Webhook ────────────────────────────────────────────────────────
+const STAYNTOUCH_BASE_URL = process.env.STAYNTOUCH_API_URL || "https://api.us1.stayntouch.com/connect";
+const STAYNTOUCH_TOKEN    = process.env.STAYNTOUCH_API_TOKEN;
+const WEBHOOK_SECRET      = process.env.STAYNTOUCH_WEBHOOK_SECRET;
+
+// Events that include full data in the payload — no callback needed
+const NO_CALLBACK_EVENTS = ["noshow_reservation", "cancel_reservation"];
+
+async function fetchReservation(reservationId) {
+  const response = await fetch(`${STAYNTOUCH_BASE_URL}/reservations/${reservationId}`, {
+    headers: {
+      Authorization: `Bearer ${STAYNTOUCH_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+  });
+  if (!response.ok) throw new Error(`StayNTouch API error: ${response.status}`);
+  return response.json();
+}
+
+function buildNotificationForEvent(event, reservation) {
+  const guestName  = reservation?.guest?.name || "Guest";
+  const roomNumber = reservation?.room?.number || "—";
+
+  switch (event) {
+    case "reservation_created":
+      return { title: "New Reservation", body: `${guestName} — Room ${roomNumber}` };
+    case "reservation_updated":
+      return { title: "Reservation Updated", body: `${guestName} — Room ${roomNumber}` };
+    case "reinstate":
+      return { title: "Reservation Reinstated", body: `${guestName} — Room ${roomNumber}` };
+    case "cancel_reservation":
+      return { title: "Reservation Cancelled", body: `${guestName} — Room ${roomNumber}` };
+    case "noshow_reservation":
+      return { title: "No-Show", body: `${guestName} — Room ${roomNumber}` };
+    default:
+      return { title: "Reservation Update", body: guestName };
+  }
+}
+
+app.post("/webhooks/stayntouch", async (req, res) => {
+  try {
+    // Validate webhook secret if configured
+    if (WEBHOOK_SECRET) {
+      const incomingSecret = req.headers["x-stayntouch-secret"] || req.headers["authorization"];
+      if (incomingSecret !== WEBHOOK_SECRET) {
+        console.warn("[Webhook] Unauthorized request rejected");
+        return res.status(401).json({ error: "Unauthorized" });
+      }
+    }
+
+    const { event, reservation_id } = req.body;
+
+    if (!event || !reservation_id) {
+      console.warn("[Webhook] Missing event or reservation_id in payload");
+      return res.status(400).json({ error: "Missing event or reservation_id" });
+    }
+
+    console.log(`[Webhook] Received event: ${event}, reservation_id: ${reservation_id}`);
+
+    let reservation = null;
+
+    if (NO_CALLBACK_EVENTS.includes(event)) {
+      // Payload contains enough info — use it directly, but only extract what we need
+      const r = req.body.reservation || {};
+      reservation = {
+        guest: { name: r.guest_name || r.guest?.name },
+        room:  { number: r.room_number || r.room?.number },
+      };
+    } else {
+      // Fetch full reservation details from StayNTouch (do not log raw response)
+      const data = await fetchReservation(reservation_id);
+      reservation = {
+        guest: { name: data?.guest?.name || data?.guest_name },
+        room:  { number: data?.room?.number || data?.room_number },
+      };
+    }
+
+    const { title, body } = buildNotificationForEvent(event, reservation);
+
+    // Send to Management and Front Desk only
+    await sendToRoles(["Management", "Front Desk"], title, body, "reservations");
+
+    res.json({ success: true, event });
+  } catch (e) {
+    console.error("[Webhook] Error processing StayNTouch webhook:", e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 // ── Start ─────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
