@@ -14,7 +14,7 @@ const config = {
   apnsTeamId: process.env.APNS_TEAM_ID || "8LH2QGPV85",
   apnsKey:    process.env.APNS_KEY,
   bundleId:   process.env.BUNDLE_ID    || "com.avaloch.Avaloch-Staff",
-  production: true,
+  production: process.env.NODE_ENV === 'production',
 };
 
 // ── Token Store ───────────────────────────────────────────────────────────────
@@ -59,13 +59,13 @@ function getProvider() {
 }
 
 // ── Send Helper ───────────────────────────────────────────────────────────────
-async function sendToRoles(roles, title, body, destination, excludeUserName = null) {
+async function sendToRoles(roles, title, body, destination, excludeDeviceID = null) {
   const provider = getProvider();
   if (!provider) return { sent: 0, error: "No APNs provider" };
 
   const tokens = Object.values(tokenStore)
     .filter(t => roles.includes(t.role))
-    .filter(t => !excludeUserName || t.userName !== excludeUserName)
+    .filter(t => !excludeDeviceID || t.deviceID !== excludeDeviceID)
     .map(t => t.token);
 
   if (tokens.length === 0) {
@@ -130,12 +130,12 @@ app.get("/", (req, res) => res.json({
 }));
 
 app.post("/notify/bulletin", async (req, res) => {
-  try { res.json({ success: true, ...await sendToRoles(ALL_ROLES, req.body.title, req.body.body, req.body.destination) }); }
+  try { res.json({ success: true, ...await sendToRoles(ALL_ROLES, req.body.title, req.body.body, req.body.destination, req.body.deviceID) }); }
   catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
 app.post("/notify/chat", async (req, res) => {
-  try { res.json({ success: true, ...await sendToRoles(ALL_ROLES, req.body.title, req.body.body, req.body.destination, req.body.senderName) }); }
+  try { res.json({ success: true, ...await sendToRoles(ALL_ROLES, req.body.title, req.body.body, req.body.destination, req.body.deviceID) }); }
   catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
@@ -150,7 +150,7 @@ app.post("/notify/reorder", async (req, res) => {
 });
 
 app.post("/notify/maintenance", async (req, res) => {
-  try { res.json({ success: true, ...await sendToRoles(["Maintenance"], req.body.title, req.body.body, req.body.destination) }); }
+  try { res.json({ success: true, ...await sendToRoles(ALL_ROLES, req.body.title, req.body.body, req.body.destination, req.body.deviceID) }); }
   catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
