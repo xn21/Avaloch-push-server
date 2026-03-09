@@ -59,12 +59,13 @@ function getProvider() {
 }
 
 // ── Send Helper ───────────────────────────────────────────────────────────────
-async function sendToRoles(roles, title, body, destination) {
+async function sendToRoles(roles, title, body, destination, excludeUserName = null) {
   const provider = getProvider();
   if (!provider) return { sent: 0, error: "No APNs provider" };
 
   const tokens = Object.values(tokenStore)
     .filter(t => roles.includes(t.role))
+    .filter(t => !excludeUserName || t.userName !== excludeUserName)
     .map(t => t.token);
 
   if (tokens.length === 0) {
@@ -73,22 +74,25 @@ async function sendToRoles(roles, title, body, destination) {
   }
 
   const notification = new apn.Notification();
-  notification.expiry          = Math.floor(Date.now() / 1000) + 3600;
-  notification.badge           = 1;
-  notification.sound           = "default";
-  notification.alert           = { title, body };
-  notification.payload         = { destination };
-  notification.topic           = config.bundleId;
-  notification.contentAvailable = 1; // silent background wake to trigger CloudKit refresh
+  notification.expiry  = Math.floor(Date.now() / 1000) + 3600;
+  notification.badge   = 1;
+  notification.sound   = "default";
+  notification.alert   = { title, body };
+  notification.payload = { destination };
+  notification.topic   = config.bundleId;
 
   const result = await provider.send(notification, tokens);
   console.log(`[APNs] Sent: ${result.sent.length}, Failed: ${result.failed.length}`);
 
   result.failed.forEach(f => {
     const reason = f.response?.reason;
+    console.log(`[APNs] Failed token: ${f.device?.substring(0, 10)}... reason: ${reason} status: ${f.status}`);
     if (reason === "BadDeviceToken" || reason === "Unregistered") {
       const entry = Object.entries(tokenStore).find(([, v]) => v.token === f.device);
-      if (entry) { delete tokenStore[entry[0]]; saveTokens(); }
+      if (entry) {
+        console.log(`[APNs] Removing bad token for ${entry[1].userName}`);
+        delete tokenStore[entry[0]]; saveTokens();
+      }
     }
   });
 
@@ -131,7 +135,7 @@ app.post("/notify/bulletin", async (req, res) => {
 });
 
 app.post("/notify/chat", async (req, res) => {
-  try { res.json({ success: true, ...await sendToRoles(ALL_ROLES, req.body.title, req.body.body, req.body.destination) }); }
+  try { res.json({ success: true, ...await sendToRoles(ALL_ROLES, req.body.title, req.body.body, req.body.destination, req.body.senderName) }); }
   catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
@@ -146,7 +150,7 @@ app.post("/notify/reorder", async (req, res) => {
 });
 
 app.post("/notify/maintenance", async (req, res) => {
-  try { res.json({ success: true, ...await sendToRoles(ALL_ROLES, req.body.title, req.body.body, req.body.destination) }); }
+  try { res.json({ success: true, ...await sendToRoles(["Maintenance"], req.body.title, req.body.body, req.body.destination) }); }
   catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
