@@ -155,29 +155,9 @@ app.post("/notify/maintenance", async (req, res) => {
 });
 
 app.post("/notify/inventory", async (req, res) => {
-  try {
-    const provider = getProvider();
-    if (!provider) return res.json({ success: false, error: "No APNs provider" });
-
-    const tokens = Object.values(tokenStore)
-      .filter(t => !req.body.deviceID || t.deviceID !== req.body.deviceID)
-      .map(t => t.token);
-
-    if (tokens.length === 0) return res.json({ success: true, sent: 0 });
-
-    // Data-only push — no banner, no sound, no badge. Just wakes the app to reload inventory.
-    const notification = new apn.Notification();
-    notification.expiry           = Math.floor(Date.now() / 1000) + 3600;
-    notification.contentAvailable = 1;
-    notification.priority         = 10;
-    notification.topic            = config.bundleId;
-    notification.payload          = { destination: "inventory" };
-    // Explicitly no alert, no sound, no badge
-
-    const result = await provider.send(notification, tokens);
-    console.log(`[APNs] Inventory data push — Sent: ${result.sent.length}, Failed: ${result.failed.length}`);
-    res.json({ success: true, sent: result.sent.length });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  // Use a real visible push so iOS delivers it reliably — the app suppresses the banner display
+  try { res.json({ success: true, ...await sendToRoles(ALL_ROLES, "inventory-sync", "inventory-sync", "inventory", req.body.deviceID) }); }
+  catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
 // ── StayNTouch Webhook ────────────────────────────────────────────────────────
