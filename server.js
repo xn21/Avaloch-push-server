@@ -155,8 +155,7 @@ app.post("/notify/maintenance", async (req, res) => {
 });
 
 app.post("/notify/inventory", async (req, res) => {
-  // Use a real visible push so iOS delivers it reliably — the app suppresses the banner display
-  try { res.json({ success: true, ...await sendToRoles(ALL_ROLES, "inventory-sync", "inventory-sync", "inventory", req.body.deviceID) }); }
+  try { res.json({ success: true, ...await sendToRoles(ALL_ROLES, req.body.title, req.body.body, req.body.destination, req.body.deviceID) }); }
   catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
