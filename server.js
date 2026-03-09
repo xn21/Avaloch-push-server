@@ -14,7 +14,7 @@ const config = {
   apnsTeamId: process.env.APNS_TEAM_ID || "8LH2QGPV85",
   apnsKey:    process.env.APNS_KEY,
   bundleId:   process.env.BUNDLE_ID    || "com.avaloch.Avaloch-Staff",
-  production: process.env.NODE_ENV === 'production',
+  production: false, // sandbox for simulator testing; set to true for AdHoc/App Store builds
 };
 
 // ── Token Store ───────────────────────────────────────────────────────────────
