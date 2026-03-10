@@ -268,7 +268,7 @@ app.post("/send-export-email", express.raw({ type: "application/octet-stream", l
     const base64Zip = req.body.toString("base64");
 
     const emailPayload = {
-      from: "Avaloch Staff App <exports@avalochinn.com>",
+      from: "Avaloch Inn <info@avalochinn.com>",
       to: [EXPORT_RECIPIENT],
       subject: `Avaloch Inn Data Backup – ${fileName}`,
       html: `
