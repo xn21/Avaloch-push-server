@@ -214,7 +214,11 @@ async function getStayntouchToken() {
 async function stayntouchGet(path) {
   const token = await getStayntouchToken();
   const response = await fetch(`${STAYNTOUCH_BASE_URL}${path}`, {
-    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+      "API-Version": "2.0",
+    },
   });
   if (!response.ok) throw new Error(`StayNTouch API error: ${response.status} ${path}`);
   return response.json();
@@ -222,28 +226,49 @@ async function stayntouchGet(path) {
 
 // ── StayNTouch Proxy Routes ───────────────────────────────────────────────────
 
-// GET /stayntouch/reservations — today's reservations, proxied from StayNTouch
+// GET /stayntouch/reservations — active reservations, proxied from StayNTouch
 app.get("/stayntouch/reservations", async (req, res) => {
   try {
     const today = new Date().toISOString().slice(0, 10);
-    const data = await stayntouchGet(
-      `/hotels/${STAYNTOUCH_HOTEL_ID}/reservations?date=${today}&status=ARRIVING,IN_HOUSE,DEPARTING`
-    );
-    // Return only the fields the app needs — no payment info, no PII beyond basics
-    const reservations = (data.reservations || data || []).map(r => ({
-      id:                  String(r.id),
-      confirmation_number: r.confirmation_number || `#${r.id}`,
-      primary_guest_name:  r.primary_guest_name  || "Guest",
-      room_number:         r.room_number         || "—",
-      room_type:           r.room_type           || "—",
-      arrival_date:        r.arrival_date,
-      departure_date:      r.departure_date,
-      adults:              r.adults              ?? 1,
-      children:            r.children            ?? 0,
-      status:              r.status,
-      rate_code:           r.rate_code           || null,
-      notes:               r.notes               || null,
-    }));
+    // Fetch currently checked-in guests + today's arrivals
+    const [checkedInData, arrivingData] = await Promise.all([
+      stayntouchGet(`/reservations?hotel_id=${STAYNTOUCH_HOTEL_ID}&status[]=CHECKEDIN`),
+      stayntouchGet(`/reservations?hotel_id=${STAYNTOUCH_HOTEL_ID}&status[]=RESERVED&arrival_date=${today}`),
+    ]);
+
+    const allResults = [
+      ...(checkedInData.results || []),
+      ...(arrivingData.results  || []),
+    ];
+
+    // Deduplicate by id
+    const seen = new Set();
+    const unique = allResults.filter(r => { if (seen.has(r.id)) return false; seen.add(r.id); return true; });
+
+    // Map to the fields the app needs — no payment info beyond basics
+    const reservations = unique.map(r => {
+      const primaryGuest = (r.guests || []).find(g => g.is_primary) || r.guests?.[0] || {};
+      const guestName = primaryGuest.first_name && primaryGuest.last_name
+        ? `${primaryGuest.first_name} ${primaryGuest.last_name}`
+        : "Guest";
+      const stayDate = (r.stay_dates || [])[0] || {};
+      const adults   = stayDate.adults   ?? r.adults   ?? 1;
+      const children = stayDate.children ?? r.children ?? 0;
+      return {
+        id:                  String(r.id),
+        confirmation_number: r.confirmation_number || `#${r.id}`,
+        primary_guest_name:  guestName,
+        room_number:         r.room?.number         || "—",
+        room_type:           r.room?.room_type_id   ? String(r.room.room_type_id) : "—",
+        arrival_date:        r.arrival_date,
+        departure_date:      r.departure_date,
+        adults,
+        children,
+        status:              r.status,
+        notes:               (r.notes || []).map(n => n.description).join(" | ") || null,
+      };
+    });
+
     res.json({ reservations });
   } catch (e) {
     console.error("[StayNTouch] /reservations error:", e.message);
@@ -254,16 +279,15 @@ app.get("/stayntouch/reservations", async (req, res) => {
 // GET /stayntouch/rooms — room statuses, proxied from StayNTouch
 app.get("/stayntouch/rooms", async (req, res) => {
   try {
-    const data = await stayntouchGet(`/hotels/${STAYNTOUCH_HOTEL_ID}/rooms`);
-    const rooms = (data.rooms || data || []).map(r => ({
-      id:                  r.id             || r.room_number,
-      room_number:         r.room_number    || "—",
-      room_type:           r.room_type      || "—",
-      building:            r.building       || "Main House",
-      occupancy_status:    r.occupancy_status,
-      housekeeping_status: r.housekeeping_status,
-      guest_name:          r.guest_name     || null,
-      check_out_date:      r.check_out_date || null,
+    const data = await stayntouchGet(`/rooms?hotel_id=${STAYNTOUCH_HOTEL_ID}`);
+    const rooms = (data.results || data.rooms || data || []).map(r => ({
+      id:                  String(r.id || r.number),
+      room_number:         r.number          || r.room_number    || "—",
+      room_type_id:        r.room_type_id    ? String(r.room_type_id) : "—",
+      floor:               r.floor?.number   || null,
+      status:              r.status          || null,
+      service_status:      r.service_status  || null,
+      occupied:            r.occupied        ?? false,
     }));
     res.json({ rooms });
   } catch (e) {
