@@ -231,18 +231,25 @@ app.get("/stayntouch/reservations", async (req, res) => {
   try {
     const today = new Date().toISOString().slice(0, 10);
 
-    // Fetch checked-in guests + today's arrivals + today's departures
-    const [checkedInData, arrivingData, departingData] = await Promise.all([
+    // Fetch all three status buckets in parallel
+    // SNT dashboard: Arrivals = RESERVED arriving today, Stayovers = CHECKEDIN, Departures = CHECKEDIN departing today
+    const [checkedInData, reservedData] = await Promise.all([
       stayntouchGet(`/reservations?hotel_id=${STAYNTOUCH_HOTEL_ID}&status=CHECKEDIN`),
-      stayntouchGet(`/reservations?hotel_id=${STAYNTOUCH_HOTEL_ID}&status=RESERVED&arrival_date=${today}`),
-      stayntouchGet(`/reservations?hotel_id=${STAYNTOUCH_HOTEL_ID}&status=CHECKEDOUT&departure_date=${today}`),
+      stayntouchGet(`/reservations?hotel_id=${STAYNTOUCH_HOTEL_ID}&status=RESERVED`),
     ]);
 
-    const allResults = [
-      ...(checkedInData.results  || []),
-      ...(arrivingData.results   || []),
-      ...(departingData.results  || []),
-    ];
+    const checkedIn = (checkedInData.results || []);
+    const reserved  = (reservedData.results  || []);
+
+    // Mirror SNT dashboard logic:
+    // - Arrivals  = RESERVED where arrival_date == today
+    // - Stayovers = CHECKEDIN where departure_date > today
+    // - Departing = CHECKEDIN where departure_date == today
+    const arrivals  = reserved.filter(r => r.arrival_date  === today);
+    const stayovers = checkedIn.filter(r => r.departure_date >  today);
+    const departing = checkedIn.filter(r => r.departure_date === today);
+
+    const allResults = [...arrivals, ...stayovers, ...departing];
 
     // Deduplicate by id
     const seen = new Set();
@@ -256,16 +263,22 @@ app.get("/stayntouch/reservations", async (req, res) => {
       const primaryGuest = (r.guests || []).find(g => g.is_primary) || r.guests?.[0] || {};
       const guestName = primaryGuest.first_name && primaryGuest.last_name
         ? `${primaryGuest.first_name} ${primaryGuest.last_name}`
-        : "Guest";
+        : (r.primary_guest_name || "Guest");
       const stayDate = (r.stay_dates || [])[0] || {};
       const adults   = stayDate.adults   ?? r.adults   ?? 1;
       const children = stayDate.children ?? r.children ?? 0;
 
-      // Clean notes — strip Way/experience booking noise, keep only plain text
+      // Determine display status to match SNT dashboard terminology
+      let displayStatus = r.status;
+      if (r.status === "CHECKEDIN" && r.departure_date === today) displayStatus = "DEPARTING";
+      if (r.status === "CHECKEDIN" && r.departure_date >  today)  displayStatus = "CHECKEDIN";
+      if (r.status === "RESERVED"  && r.arrival_date  === today)  displayStatus = "RESERVED";
+
+      // Clean notes — strip Way/experience booking noise
       let notes = null;
       if (r.notes && Array.isArray(r.notes)) {
         const clean = r.notes
-          .map(n => n.description || "")
+          .map(n => n.description || n.text || "")
           .filter(n => n && !n.startsWith("Way confirmation code"))
           .join(" | ");
         notes = clean || null;
@@ -283,10 +296,13 @@ app.get("/stayntouch/reservations", async (req, res) => {
         departure_date:      r.departure_date,
         adults,
         children,
-        status:              r.status,
+        status:              displayStatus,
         notes,
       };
     });
+
+    // Log summary to match SNT dashboard for debugging
+    console.log(`[StayNTouch] Reservations for ${today}: ${arrivals.length} arriving, ${stayovers.length} stayovers, ${departing.length} departing`);
 
     res.json({ reservations });
   } catch (e) {
@@ -299,16 +315,23 @@ app.get("/stayntouch/reservations", async (req, res) => {
 app.get("/stayntouch/rooms", async (req, res) => {
   try {
     const data = await stayntouchGet(`/rooms?hotel_id=${STAYNTOUCH_HOTEL_ID}`);
-    const rooms = (data.results || data.rooms || data || []).map(r => ({
-      id:                  String(r.id || r.number),
-      room_number:         r.number          || r.room_number    || "—",
-      room_type_id:        r.room_type_id    ? String(r.room_type_id) : "—",
-      floor:               r.floor?.number   || null,
-      status:              r.status          || null,
-      service_status:      r.service_status  || null,
-      occupied:            r.occupied        ?? false,
+    const rawRooms = data.results || data.rooms || data || [];
+
+    const rooms = rawRooms.map(r => ({
+      id:             String(r.id || r.number),
+      room_number:    r.number         || r.room_number || "—",
+      room_type_id:   r.room_type_id   ? String(r.room_type_id) : "—",
+      floor:          r.floor?.number  || null,
+      status:         r.status         || null,   // CLEAN, DIRTY, INSPECTED, etc.
+      service_status: r.service_status || null,   // IN_SERVICE, OUT_OF_SERVICE
+      occupied:       r.occupied       ?? false,
     }));
-    res.json({ rooms });
+
+    const occupiedCount = rooms.filter(r => r.occupied).length;
+    const totalCount    = rooms.length;
+
+    console.log(`[StayNTouch] Rooms: ${occupiedCount}/${totalCount} occupied`);
+    res.json({ rooms, occupied_count: occupiedCount, total_count: totalCount });
   } catch (e) {
     console.error("[StayNTouch] /rooms error:", e.message);
     res.status(500).json({ error: e.message });
