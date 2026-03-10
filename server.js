@@ -230,22 +230,28 @@ async function stayntouchGet(path) {
 app.get("/stayntouch/reservations", async (req, res) => {
   try {
     const today = new Date().toISOString().slice(0, 10);
-    // Fetch currently checked-in guests + today's arrivals
-    const [checkedInData, arrivingData] = await Promise.all([
+
+    // Fetch checked-in guests + today's arrivals + today's departures
+    const [checkedInData, arrivingData, departingData] = await Promise.all([
       stayntouchGet(`/reservations?hotel_id=${STAYNTOUCH_HOTEL_ID}&status=CHECKEDIN`),
       stayntouchGet(`/reservations?hotel_id=${STAYNTOUCH_HOTEL_ID}&status=RESERVED&arrival_date=${today}`),
+      stayntouchGet(`/reservations?hotel_id=${STAYNTOUCH_HOTEL_ID}&status=CHECKEDOUT&departure_date=${today}`),
     ]);
 
     const allResults = [
-      ...(checkedInData.results || []),
-      ...(arrivingData.results  || []),
+      ...(checkedInData.results  || []),
+      ...(arrivingData.results   || []),
+      ...(departingData.results  || []),
     ];
 
     // Deduplicate by id
     const seen = new Set();
-    const unique = allResults.filter(r => { if (seen.has(r.id)) return false; seen.add(r.id); return true; });
+    const unique = allResults.filter(r => {
+      if (seen.has(r.id)) return false;
+      seen.add(r.id);
+      return true;
+    });
 
-    // Map to the fields the app needs — no payment info beyond basics
     const reservations = unique.map(r => {
       const primaryGuest = (r.guests || []).find(g => g.is_primary) || r.guests?.[0] || {};
       const guestName = primaryGuest.first_name && primaryGuest.last_name
@@ -254,6 +260,19 @@ app.get("/stayntouch/reservations", async (req, res) => {
       const stayDate = (r.stay_dates || [])[0] || {};
       const adults   = stayDate.adults   ?? r.adults   ?? 1;
       const children = stayDate.children ?? r.children ?? 0;
+
+      // Clean notes — strip Way/experience booking noise, keep only plain text
+      let notes = null;
+      if (r.notes && Array.isArray(r.notes)) {
+        const clean = r.notes
+          .map(n => n.description || "")
+          .filter(n => n && !n.startsWith("Way confirmation code"))
+          .join(" | ");
+        notes = clean || null;
+      } else if (typeof r.notes === "string" && r.notes && !r.notes.startsWith("Way confirmation code")) {
+        notes = r.notes;
+      }
+
       return {
         id:                  String(r.id),
         confirmation_number: r.confirmation_number || `#${r.id}`,
@@ -265,7 +284,7 @@ app.get("/stayntouch/reservations", async (req, res) => {
         adults,
         children,
         status:              r.status,
-        notes:               (r.notes || []).map(n => n.description).join(" | ") || null,
+        notes,
       };
     });
 
