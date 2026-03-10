@@ -170,17 +170,54 @@ app.post("/notify/competitor-rates", async (req, res) => {
 });
 
 // ── StayNTouch Webhook ────────────────────────────────────────────────────────
-const STAYNTOUCH_BASE_URL = process.env.STAYNTOUCH_API_URL || "https://api.us1.stayntouch.com/connect";
-const STAYNTOUCH_TOKEN    = process.env.STAYNTOUCH_API_TOKEN;
-const WEBHOOK_SECRET      = process.env.STAYNTOUCH_WEBHOOK_SECRET;
+const STAYNTOUCH_BASE_URL      = process.env.STAYNTOUCH_API_URL      || "https://api.uat.stayntouch.com/connect";
+const STAYNTOUCH_AUTH_URL      = process.env.STAYNTOUCH_AUTH_URL     || "https://auth-uat.stayntouch.com/oauth/token";
+const STAYNTOUCH_CLIENT_ID     = process.env.STAYNTOUCH_CLIENT_ID;
+const STAYNTOUCH_CLIENT_SECRET = process.env.STAYNTOUCH_CLIENT_SECRET;
+const WEBHOOK_SECRET           = process.env.STAYNTOUCH_WEBHOOK_SECRET;
+
+// ── Token cache (auto-refreshes, no manual rotation needed) ──────────────────
+let stayntouchToken = {
+  value:     process.env.STAYNTOUCH_API_TOKEN || null,
+  expiresAt: process.env.STAYNTOUCH_API_TOKEN ? Date.now() + 25 * 24 * 60 * 60 * 1000 : 0,
+};
+
+async function getStayntouchToken() {
+  // Return cached token if still valid (with 1hr buffer)
+  if (stayntouchToken.value && Date.now() < stayntouchToken.expiresAt - 60 * 60 * 1000) {
+    return stayntouchToken.value;
+  }
+  if (!STAYNTOUCH_CLIENT_ID || !STAYNTOUCH_CLIENT_SECRET) {
+    throw new Error("Missing STAYNTOUCH_CLIENT_ID or STAYNTOUCH_CLIENT_SECRET");
+  }
+  console.log("[StayNTouch] Refreshing API token...");
+  const response = await fetch(STAYNTOUCH_AUTH_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      client_id:     STAYNTOUCH_CLIENT_ID,
+      client_secret: STAYNTOUCH_CLIENT_SECRET,
+      grant_type:    "client_credentials",
+    }),
+  });
+  if (!response.ok) throw new Error(`Token refresh failed: ${response.status}`);
+  const data = await response.json();
+  stayntouchToken = {
+    value:     data.access_token,
+    expiresAt: Date.now() + (data.expires_in * 1000),
+  };
+  console.log("[StayNTouch] Token refreshed successfully");
+  return stayntouchToken.value;
+}
 
 // Events that include full data in the payload — no callback needed
 const NO_CALLBACK_EVENTS = ["noshow_reservation", "cancel_reservation"];
 
 async function fetchReservation(reservationId) {
+  const token = await getStayntouchToken();
   const response = await fetch(`${STAYNTOUCH_BASE_URL}/reservations/${reservationId}`, {
     headers: {
-      Authorization: `Bearer ${STAYNTOUCH_TOKEN}`,
+      Authorization: `Bearer ${token}`,
       "Content-Type": "application/json",
     },
   });
@@ -203,6 +240,8 @@ function buildNotificationForEvent(event, reservation) {
       return { title: "Reservation Cancelled", body: `${guestName} — Room ${roomNumber}` };
     case "noshow_reservation":
       return { title: "No-Show", body: `${guestName} — Room ${roomNumber}` };
+    case "card_replace":
+      return { title: "Card Updated", body: `${guestName} — Room ${roomNumber}` };
     default:
       return { title: "Reservation Update", body: guestName };
   }
