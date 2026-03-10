@@ -232,8 +232,8 @@ app.get("/stayntouch/reservations", async (req, res) => {
     const today = new Date().toISOString().slice(0, 10);
     // Fetch currently checked-in guests + today's arrivals
     const [checkedInData, arrivingData] = await Promise.all([
-      stayntouchGet(`/reservations?hotel_id=${STAYNTOUCH_HOTEL_ID}&status[]=CHECKEDIN`),
-      stayntouchGet(`/reservations?hotel_id=${STAYNTOUCH_HOTEL_ID}&status[]=RESERVED&arrival_date=${today}`),
+      stayntouchGet(`/reservations?hotel_id=${STAYNTOUCH_HOTEL_ID}&status=CHECKEDIN`),
+      stayntouchGet(`/reservations?hotel_id=${STAYNTOUCH_HOTEL_ID}&status=RESERVED&arrival_date=${today}`),
     ]);
 
     const allResults = [
