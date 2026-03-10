@@ -159,6 +159,11 @@ app.post("/notify/inventory", async (req, res) => {
   catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
+app.post("/notify/guest-experience", async (req, res) => {
+  try { res.json({ success: true, ...await sendToRoles(["Management", "Front Desk"], req.body.title, req.body.body, req.body.destination, req.body.deviceID) }); }
+  catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
 // ── StayNTouch Webhook ────────────────────────────────────────────────────────
 const STAYNTOUCH_BASE_URL = process.env.STAYNTOUCH_API_URL || "https://api.us1.stayntouch.com/connect";
 const STAYNTOUCH_TOKEN    = process.env.STAYNTOUCH_API_TOKEN;
