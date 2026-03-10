@@ -248,6 +248,68 @@ app.post("/webhooks/stayntouch", async (req, res) => {
   }
 });
 
+// ── Data Export Email (Resend) ────────────────────────────────────────────────
+const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
+const EXPORT_RECIPIENT = "christian@avalochinn.com";
+
+app.post("/send-export-email", express.raw({ type: "application/octet-stream", limit: "50mb" }), async (req, res) => {
+  try {
+    const fileName = req.headers["x-filename"] || "avaloch-backup.zip";
+
+    if (!RESEND_API_KEY) {
+      console.warn("[Export] No RESEND_API_KEY configured");
+      return res.status(500).json({ success: false, error: "Email service not configured" });
+    }
+
+    if (!req.body || req.body.length === 0) {
+      return res.status(400).json({ success: false, error: "No file data received" });
+    }
+
+    const base64Zip = req.body.toString("base64");
+
+    const emailPayload = {
+      from: "Avaloch Staff App <exports@avalochinn.com>",
+      to: [EXPORT_RECIPIENT],
+      subject: `Avaloch Inn Data Backup – ${fileName}`,
+      html: `
+        <p>Automated data backup from the Avaloch Staff App.</p>
+        <p><strong>File:</strong> ${fileName}</p>
+        <p><strong>Generated:</strong> ${new Date().toLocaleString("en-US", { timeZone: "America/New_York" })}</p>
+        <p>All app data is attached as a ZIP file containing individual CSVs per record type.</p>
+      `,
+      attachments: [
+        {
+          filename: fileName,
+          content: base64Zip,
+        },
+      ],
+    };
+
+    const response = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${RESEND_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(emailPayload),
+    });
+
+    const result = await response.json();
+
+    if (!response.ok) {
+      console.error("[Export] Resend error:", result);
+      return res.status(500).json({ success: false, error: result.message || "Email send failed" });
+    }
+
+    console.log(`[Export] Email sent successfully to ${EXPORT_RECIPIENT}, id: ${result.id}`);
+    res.json({ success: true, emailId: result.id });
+
+  } catch (e) {
+    console.error("[Export] Email endpoint error:", e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 // ── Start ─────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
