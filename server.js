@@ -174,6 +174,7 @@ const STAYNTOUCH_BASE_URL      = process.env.STAYNTOUCH_API_URL      || "https:/
 const STAYNTOUCH_AUTH_URL      = process.env.STAYNTOUCH_AUTH_URL     || "https://auth-uat.stayntouch.com/oauth/token";
 const STAYNTOUCH_CLIENT_ID     = process.env.STAYNTOUCH_CLIENT_ID;
 const STAYNTOUCH_CLIENT_SECRET = process.env.STAYNTOUCH_CLIENT_SECRET;
+const STAYNTOUCH_HOTEL_ID      = process.env.STAYNTOUCH_HOTEL_ID     || "300";
 const WEBHOOK_SECRET           = process.env.STAYNTOUCH_WEBHOOK_SECRET;
 
 // ── Token cache (auto-refreshes, no manual rotation needed) ──────────────────
@@ -210,40 +211,87 @@ async function getStayntouchToken() {
   return stayntouchToken.value;
 }
 
-// Events that include full data in the payload — no callback needed
-const NO_CALLBACK_EVENTS = ["noshow_reservation", "cancel_reservation"];
-
-async function fetchReservation(reservationId) {
+async function stayntouchGet(path) {
   const token = await getStayntouchToken();
-  const response = await fetch(`${STAYNTOUCH_BASE_URL}/reservations/${reservationId}`, {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
+  const response = await fetch(`${STAYNTOUCH_BASE_URL}${path}`, {
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
   });
-  if (!response.ok) throw new Error(`StayNTouch API error: ${response.status}`);
+  if (!response.ok) throw new Error(`StayNTouch API error: ${response.status} ${path}`);
   return response.json();
 }
 
-function buildNotificationForEvent(event, reservation) {
-  const guestName  = reservation?.guest?.name || "Guest";
-  const roomNumber = reservation?.room?.number || "—";
+// ── StayNTouch Proxy Routes ───────────────────────────────────────────────────
 
+// GET /stayntouch/reservations — today's reservations, proxied from StayNTouch
+app.get("/stayntouch/reservations", async (req, res) => {
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const data = await stayntouchGet(
+      `/hotels/${STAYNTOUCH_HOTEL_ID}/reservations?date=${today}&status=ARRIVING,IN_HOUSE,DEPARTING`
+    );
+    // Return only the fields the app needs — no payment info, no PII beyond basics
+    const reservations = (data.reservations || data || []).map(r => ({
+      id:                  String(r.id),
+      confirmation_number: r.confirmation_number || `#${r.id}`,
+      primary_guest_name:  r.primary_guest_name  || "Guest",
+      room_number:         r.room_number         || "—",
+      room_type:           r.room_type           || "—",
+      arrival_date:        r.arrival_date,
+      departure_date:      r.departure_date,
+      adults:              r.adults              ?? 1,
+      children:            r.children            ?? 0,
+      status:              r.status,
+      rate_code:           r.rate_code           || null,
+      notes:               r.notes               || null,
+    }));
+    res.json({ reservations });
+  } catch (e) {
+    console.error("[StayNTouch] /reservations error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /stayntouch/rooms — room statuses, proxied from StayNTouch
+app.get("/stayntouch/rooms", async (req, res) => {
+  try {
+    const data = await stayntouchGet(`/hotels/${STAYNTOUCH_HOTEL_ID}/rooms`);
+    const rooms = (data.rooms || data || []).map(r => ({
+      id:                  r.id             || r.room_number,
+      room_number:         r.room_number    || "—",
+      room_type:           r.room_type      || "—",
+      building:            r.building       || "Main House",
+      occupancy_status:    r.occupancy_status,
+      housekeeping_status: r.housekeeping_status,
+      guest_name:          r.guest_name     || null,
+      check_out_date:      r.check_out_date || null,
+    }));
+    res.json({ rooms });
+  } catch (e) {
+    console.error("[StayNTouch] /rooms error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── StayNTouch Webhook Handler ────────────────────────────────────────────────
+
+// Events that carry enough info in the payload — no callback needed
+const NO_CALLBACK_EVENTS = ["noshow_reservation", "cancel_reservation"];
+
+async function fetchReservation(reservationId) {
+  return stayntouchGet(`/reservations/${reservationId}`);
+}
+
+function buildNotificationForEvent(event, reservation) {
+  const guestName  = reservation?.guest?.name || reservation?.primary_guest_name || "Guest";
+  const roomNumber = reservation?.room?.number || reservation?.room_number || "—";
   switch (event) {
-    case "reservation_created":
-      return { title: "New Reservation", body: `${guestName} — Room ${roomNumber}` };
-    case "reservation_updated":
-      return { title: "Reservation Updated", body: `${guestName} — Room ${roomNumber}` };
-    case "reinstate":
-      return { title: "Reservation Reinstated", body: `${guestName} — Room ${roomNumber}` };
-    case "cancel_reservation":
-      return { title: "Reservation Cancelled", body: `${guestName} — Room ${roomNumber}` };
-    case "noshow_reservation":
-      return { title: "No-Show", body: `${guestName} — Room ${roomNumber}` };
-    case "card_replace":
-      return { title: "Card Updated", body: `${guestName} — Room ${roomNumber}` };
-    default:
-      return { title: "Reservation Update", body: guestName };
+    case "reservation_created":  return { title: "New Reservation",        body: `${guestName} — Room ${roomNumber}` };
+    case "reservation_updated":  return { title: "Reservation Updated",    body: `${guestName} — Room ${roomNumber}` };
+    case "reinstate":            return { title: "Reservation Reinstated", body: `${guestName} — Room ${roomNumber}` };
+    case "cancel_reservation":   return { title: "Reservation Cancelled",  body: `${guestName} — Room ${roomNumber}` };
+    case "noshow_reservation":   return { title: "No-Show",                body: `${guestName} — Room ${roomNumber}` };
+    case "card_replace":         return { title: "Card Updated",           body: `${guestName} — Room ${roomNumber}` };
+    default:                     return { title: "Reservation Update",     body: guestName };
   }
 }
 
