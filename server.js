@@ -177,6 +177,15 @@ const STAYNTOUCH_CLIENT_SECRET = process.env.STAYNTOUCH_CLIENT_SECRET;
 const STAYNTOUCH_HOTEL_ID      = process.env.STAYNTOUCH_HOTEL_ID     || "300";
 const WEBHOOK_SECRET           = process.env.STAYNTOUCH_WEBHOOK_SECRET;
 
+// Log SNT env on boot so we can see exactly what the server is working with
+console.log(`[StayNTouch] Boot config:
+  API URL:        ${STAYNTOUCH_BASE_URL}
+  Auth URL:       ${STAYNTOUCH_AUTH_URL}
+  Hotel ID:       ${STAYNTOUCH_HOTEL_ID}
+  Client ID set:  ${!!STAYNTOUCH_CLIENT_ID}
+  Secret set:     ${!!STAYNTOUCH_CLIENT_SECRET}
+  Static token:   ${process.env.STAYNTOUCH_API_TOKEN ? "PRESENT (will block refresh)" : "not set (good)"}`);
+
 // ── Token cache (auto-refreshes, no manual rotation needed) ──────────────────
 let stayntouchToken = {
   value:     process.env.STAYNTOUCH_API_TOKEN || null,
@@ -186,6 +195,7 @@ let stayntouchToken = {
 async function getStayntouchToken() {
   // Return cached token if still valid (with 1hr buffer)
   if (stayntouchToken.value && Date.now() < stayntouchToken.expiresAt - 60 * 60 * 1000) {
+    console.log(`[StayNTouch] Using cached token (expires in ${Math.round((stayntouchToken.expiresAt - Date.now()) / 3600000)}h)`);
     return stayntouchToken.value;
   }
   if (!STAYNTOUCH_CLIENT_ID || !STAYNTOUCH_CLIENT_SECRET) {
@@ -201,15 +211,30 @@ async function getStayntouchToken() {
       grant_type:    "client_credentials",
     }),
   });
-  if (!response.ok) throw new Error(`Token refresh failed: ${response.status}`);
+  if (!response.ok) {
+    const errText = await response.text().catch(() => "");
+    console.error(`[StayNTouch] Token refresh failed: ${response.status} — ${errText.substring(0, 200)}`);
+    throw new Error(`Token refresh failed: ${response.status}`);
+  }
   const data = await response.json();
   stayntouchToken = {
     value:     data.access_token,
     expiresAt: Date.now() + (data.expires_in * 1000),
   };
-  console.log("[StayNTouch] Token refreshed successfully");
+  console.log(`[StayNTouch] Token refreshed successfully, expires in ${Math.round(data.expires_in / 3600)}h`);
   return stayntouchToken.value;
 }
+
+// Admin endpoint to force a token refresh without restarting the server
+app.post("/admin/refresh-token", async (req, res) => {
+  try {
+    stayntouchToken = { value: null, expiresAt: 0 };
+    const token = await getStayntouchToken();
+    res.json({ success: true, tokenPrefix: token.substring(0, 12) + "..." });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
 
 async function stayntouchGet(path) {
   const token = await getStayntouchToken();
@@ -320,8 +345,9 @@ app.get("/stayntouch/reservations", async (req, res) => {
 });
 
 // GET /stayntouch/reservations/search?lastName=X — reservation lookup by last name
-// Tries SNT's native last_name filter, and also filters in-memory as a safety net
-// in case SNT ignores the filter (historically unreliable with e.g. arrival_date).
+// SNT's /reservations endpoint appears to require a `status` filter (without it,
+// results are empty). We query all relevant status buckets in parallel, merge,
+// dedupe, and filter locally by last name.
 app.get("/stayntouch/reservations/search", async (req, res) => {
   try {
     const lastName = (req.query.lastName || "").trim();
@@ -330,39 +356,60 @@ app.get("/stayntouch/reservations/search", async (req, res) => {
     }
 
     const today = new Date().toISOString().slice(0, 10);
-    const encoded = encodeURIComponent(lastName);
 
-    // Ask SNT to filter by last_name. Pull a generous page size so that even if
-    // SNT ignores the filter, we still have a good pool to filter locally.
-    const path = `/reservations?hotel_id=${STAYNTOUCH_HOTEL_ID}&last_name=${encoded}&per_page=50`;
-    const data = await stayntouchGet(path);
-    const rawResults = data.results || [];
+    // Query each status bucket in parallel. SNT requires `status` to return results.
+    // CHECKEDOUT can be high-volume so we cap per_page aggressively.
+    const statuses = ["CHECKEDIN", "RESERVED", "CHECKEDOUT"];
+    const bucketResults = await Promise.all(
+      statuses.map(s =>
+        stayntouchGet(`/reservations?hotel_id=${STAYNTOUCH_HOTEL_ID}&status=${s}&per_page=50`)
+          .then(data => ({ status: s, results: data.results || [] }))
+          .catch(err => {
+            console.warn(`[StayNTouch] Search: failed to fetch ${s}: ${err.message}`);
+            return { status: s, results: [] };
+          })
+      )
+    );
 
-    // Local filter — case-insensitive substring match on any guest's last name.
-    // If SNT honored the filter this is a no-op; if not, this enforces it.
+    // Merge + dedupe by id
+    const seen = new Set();
+    const all = [];
+    for (const bucket of bucketResults) {
+      for (const r of bucket.results) {
+        if (!seen.has(r.id)) {
+          seen.add(r.id);
+          all.push(r);
+        }
+      }
+    }
+
+    // Local filter: case-insensitive match against:
+    // (1) any guest's last_name, or
+    // (2) the primary_guest_name string (catches edge cases like "Jon Snow(SALIDO)")
     const lower = lastName.toLowerCase();
-    const matches = rawResults.filter(r => {
+    const matches = all.filter(r => {
       const guests = r.guests || [];
-      return guests.some(g => (g.last_name || "").toLowerCase().includes(lower));
+      const guestLastMatch = guests.some(g => (g.last_name || "").toLowerCase().includes(lower));
+      const primaryNameMatch = (r.primary_guest_name || "").toLowerCase().includes(lower);
+      return guestLastMatch || primaryNameMatch;
     });
 
-    // Sort: most relevant first — future arrivals, then in-house, then past
+    // Sort: most relevant first — reservations closest to today
     matches.sort((a, b) => {
-      const aDate = a.arrival_date || "";
-      const bDate = b.arrival_date || "";
-      // Prefer reservations closer to today
-      const aDistance = Math.abs(new Date(aDate) - new Date(today));
-      const bDistance = Math.abs(new Date(bDate) - new Date(today));
-      return aDistance - bDistance;
+      const aDist = Math.abs(new Date(a.arrival_date || 0) - new Date(today));
+      const bDist = Math.abs(new Date(b.arrival_date || 0) - new Date(today));
+      return aDist - bDist;
     });
 
     const reservations = matches.map(r => mapReservationSummary(r, today));
 
-    console.log(`[StayNTouch] Search "${lastName}": SNT returned ${rawResults.length}, matched ${matches.length}`);
+    const bucketBreakdown = bucketResults.map(b => `${b.status}:${b.results.length}`).join(" ");
+    console.log(`[StayNTouch] Search "${lastName}": buckets(${bucketBreakdown}) = ${all.length} unique, matched ${matches.length}`);
+
     res.json({
       reservations,
       total: matches.length,
-      truncated: rawResults.length >= 50, // hint for UI if there may be more
+      truncated: all.length >= 150, // rough upper bound (3 buckets * 50)
     });
   } catch (e) {
     console.error("[StayNTouch] /reservations/search error:", e.message);
