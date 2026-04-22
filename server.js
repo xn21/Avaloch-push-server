@@ -224,6 +224,54 @@ async function stayntouchGet(path) {
   return response.json();
 }
 
+// ── Shared Mapping Helper ─────────────────────────────────────────────────────
+
+// Maps a raw SNT reservation into the compact summary shape used by the iOS app's
+// Reservation model. Used by both /reservations (today's buckets) and /reservations/search.
+function mapReservationSummary(r, today) {
+  today = today || new Date().toISOString().slice(0, 10);
+
+  const primaryGuest = (r.guests || []).find(g => g.is_primary) || r.guests?.[0] || {};
+  const guestName = primaryGuest.first_name && primaryGuest.last_name
+    ? `${primaryGuest.first_name} ${primaryGuest.last_name}`
+    : (r.primary_guest_name || "Guest");
+  const stayDate = (r.stay_dates || [])[0] || {};
+  const adults   = stayDate.adults   ?? r.adults   ?? 1;
+  const children = stayDate.children ?? r.children ?? 0;
+
+  // Display status — align with SNT dashboard terminology
+  let displayStatus = r.status;
+  if (r.status === "CHECKEDIN" && r.departure_date === today) displayStatus = "DEPARTING";
+  if (r.status === "CHECKEDIN" && r.departure_date >  today)  displayStatus = "CHECKEDIN";
+  if (r.status === "RESERVED"  && r.arrival_date  === today)  displayStatus = "RESERVED";
+
+  // Clean notes — strip Way/experience booking noise
+  let notes = null;
+  if (r.notes && Array.isArray(r.notes)) {
+    const clean = r.notes
+      .map(n => n.description || n.text || "")
+      .filter(n => n && !n.startsWith("Way confirmation code"))
+      .join(" | ");
+    notes = clean || null;
+  } else if (typeof r.notes === "string" && r.notes && !r.notes.startsWith("Way confirmation code")) {
+    notes = r.notes;
+  }
+
+  return {
+    id:                  String(r.id),
+    confirmation_number: r.confirmation_number || `#${r.id}`,
+    primary_guest_name:  guestName,
+    room_number:         r.room?.number         || "—",
+    room_type:           r.room?.room_type_id   ? String(r.room.room_type_id) : "—",
+    arrival_date:        r.arrival_date,
+    departure_date:      r.departure_date,
+    adults,
+    children,
+    status:              displayStatus,
+    notes,
+  };
+}
+
 // ── StayNTouch Proxy Routes ───────────────────────────────────────────────────
 
 // GET /stayntouch/reservations — active reservations, proxied from StayNTouch
@@ -259,47 +307,7 @@ app.get("/stayntouch/reservations", async (req, res) => {
       return true;
     });
 
-    const reservations = unique.map(r => {
-      const primaryGuest = (r.guests || []).find(g => g.is_primary) || r.guests?.[0] || {};
-      const guestName = primaryGuest.first_name && primaryGuest.last_name
-        ? `${primaryGuest.first_name} ${primaryGuest.last_name}`
-        : (r.primary_guest_name || "Guest");
-      const stayDate = (r.stay_dates || [])[0] || {};
-      const adults   = stayDate.adults   ?? r.adults   ?? 1;
-      const children = stayDate.children ?? r.children ?? 0;
-
-      // Determine display status to match SNT dashboard terminology
-      let displayStatus = r.status;
-      if (r.status === "CHECKEDIN" && r.departure_date === today) displayStatus = "DEPARTING";
-      if (r.status === "CHECKEDIN" && r.departure_date >  today)  displayStatus = "CHECKEDIN";
-      if (r.status === "RESERVED"  && r.arrival_date  === today)  displayStatus = "RESERVED";
-
-      // Clean notes — strip Way/experience booking noise
-      let notes = null;
-      if (r.notes && Array.isArray(r.notes)) {
-        const clean = r.notes
-          .map(n => n.description || n.text || "")
-          .filter(n => n && !n.startsWith("Way confirmation code"))
-          .join(" | ");
-        notes = clean || null;
-      } else if (typeof r.notes === "string" && r.notes && !r.notes.startsWith("Way confirmation code")) {
-        notes = r.notes;
-      }
-
-      return {
-        id:                  String(r.id),
-        confirmation_number: r.confirmation_number || `#${r.id}`,
-        primary_guest_name:  guestName,
-        room_number:         r.room?.number         || "—",
-        room_type:           r.room?.room_type_id   ? String(r.room.room_type_id) : "—",
-        arrival_date:        r.arrival_date,
-        departure_date:      r.departure_date,
-        adults,
-        children,
-        status:              displayStatus,
-        notes,
-      };
-    });
+    const reservations = unique.map(r => mapReservationSummary(r, today));
 
     // Log summary to match SNT dashboard for debugging
     console.log(`[StayNTouch] Reservations for ${today}: ${arrivals.length} arriving, ${stayovers.length} stayovers, ${departing.length} departing`);
@@ -307,6 +315,72 @@ app.get("/stayntouch/reservations", async (req, res) => {
     res.json({ reservations });
   } catch (e) {
     console.error("[StayNTouch] /reservations error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /stayntouch/reservations/search?lastName=X — reservation lookup by last name
+// Tries SNT's native last_name filter, and also filters in-memory as a safety net
+// in case SNT ignores the filter (historically unreliable with e.g. arrival_date).
+app.get("/stayntouch/reservations/search", async (req, res) => {
+  try {
+    const lastName = (req.query.lastName || "").trim();
+    if (lastName.length < 2) {
+      return res.status(400).json({ error: "lastName must be at least 2 characters" });
+    }
+
+    const today = new Date().toISOString().slice(0, 10);
+    const encoded = encodeURIComponent(lastName);
+
+    // Ask SNT to filter by last_name. Pull a generous page size so that even if
+    // SNT ignores the filter, we still have a good pool to filter locally.
+    const path = `/reservations?hotel_id=${STAYNTOUCH_HOTEL_ID}&last_name=${encoded}&per_page=50`;
+    const data = await stayntouchGet(path);
+    const rawResults = data.results || [];
+
+    // Local filter — case-insensitive substring match on any guest's last name.
+    // If SNT honored the filter this is a no-op; if not, this enforces it.
+    const lower = lastName.toLowerCase();
+    const matches = rawResults.filter(r => {
+      const guests = r.guests || [];
+      return guests.some(g => (g.last_name || "").toLowerCase().includes(lower));
+    });
+
+    // Sort: most relevant first — future arrivals, then in-house, then past
+    matches.sort((a, b) => {
+      const aDate = a.arrival_date || "";
+      const bDate = b.arrival_date || "";
+      // Prefer reservations closer to today
+      const aDistance = Math.abs(new Date(aDate) - new Date(today));
+      const bDistance = Math.abs(new Date(bDate) - new Date(today));
+      return aDistance - bDistance;
+    });
+
+    const reservations = matches.map(r => mapReservationSummary(r, today));
+
+    console.log(`[StayNTouch] Search "${lastName}": SNT returned ${rawResults.length}, matched ${matches.length}`);
+    res.json({
+      reservations,
+      total: matches.length,
+      truncated: rawResults.length >= 50, // hint for UI if there may be more
+    });
+  } catch (e) {
+    console.error("[StayNTouch] /reservations/search error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /stayntouch/reservations/:id — full reservation detail, passed through raw
+app.get("/stayntouch/reservations/:id", async (req, res) => {
+  try {
+    const id = req.params.id;
+    if (!/^\d+$/.test(id)) {
+      return res.status(400).json({ error: "Invalid reservation id" });
+    }
+    const data = await stayntouchGet(`/reservations/${id}?hotel_id=${STAYNTOUCH_HOTEL_ID}`);
+    res.json(data);
+  } catch (e) {
+    console.error(`[StayNTouch] /reservations/${req.params.id} error:`, e.message);
     res.status(500).json({ error: e.message });
   }
 });
