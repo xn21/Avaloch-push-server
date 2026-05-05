@@ -2,6 +2,7 @@
 // Avaloch Staff Push Notification Server
 
 const express = require("express");
+const cors    = require("cors");
 const apn     = require("apn");
 const fs      = require("fs");
 
@@ -249,11 +250,64 @@ async function stayntouchGet(path) {
   return response.json();
 }
 
+// ── Room-type catalog cache ───────────────────────────────────────────────────
+//
+// SNT identifies room types by numeric IDs in /reservations and /rooms responses.
+// Avaloch-side filtering (lodge-only, room type breakdowns, etc.) operates on
+// short codes (LKW / LDW / LKM / LDM). We hit /hotels/{id}/room_types once per
+// TTL window to build an id→code map and enrich downstream responses.
+//
+// 10-minute TTL is plenty — room type catalogs change rarely and a stale entry
+// just means a freshly-added room type renders as null code until refresh.
+
+let roomTypeMapCache = { value: null, fetchedAt: 0 };
+const ROOM_TYPE_CACHE_TTL_MS = 10 * 60 * 1000;
+
+async function getRoomTypeMap() {
+  const now = Date.now();
+  if (roomTypeMapCache.value && now - roomTypeMapCache.fetchedAt < ROOM_TYPE_CACHE_TTL_MS) {
+    return roomTypeMapCache.value;
+  }
+  try {
+    const data = await stayntouchGet(`/hotels/${STAYNTOUCH_HOTEL_ID}/room_types`);
+    const list = data.results || data || [];
+    const map = {};
+    for (const rt of list) {
+      // SNT shape varies — try the common keys for the short code
+      const code = rt.code || rt.short_code || rt.abbreviation || rt.room_type_code || null;
+      if (rt.id != null) map[String(rt.id)] = code;
+    }
+    roomTypeMapCache = { value: map, fetchedAt: now };
+    console.log(`[StayNTouch] Room-type map refreshed: ${Object.keys(map).length} types`);
+    return map;
+  } catch (e) {
+    console.warn(`[StayNTouch] getRoomTypeMap failed: ${e.message}`);
+    // Return last-known map if we have one — better stale than empty
+    return roomTypeMapCache.value || {};
+  }
+}
+
 // ── Shared Mapping Helper ─────────────────────────────────────────────────────
+
+// Resolve the most specific room_type_id we can for a reservation:
+//   1. The actual room assignment (post-checkin or pre-assigned), then
+//   2. The first stay_date's room_type_id (always populated, even pre-assignment)
+// This lets the frontend lodge-filter RESERVED rows before a room is allocated.
+function pickRoomTypeId(r) {
+  if (r.room?.room_type_id != null) return String(r.room.room_type_id);
+  const sd = (r.stay_dates || [])[0];
+  if (sd?.room_type_id != null) return String(sd.room_type_id);
+  return null;
+}
 
 // Maps a raw SNT reservation into the compact summary shape used by the iOS app's
 // Reservation model. Used by both /reservations (today's buckets) and /reservations/search.
-function mapReservationSummary(r, today) {
+//
+// IMPORTANT: existing fields (id, confirmation_number, primary_guest_name,
+// room_number, room_type, arrival_date, departure_date, adults, children,
+// status, notes) MUST stay shape-compatible — the iOS app reads them. Add new
+// fields, don't repurpose old ones.
+function mapReservationSummary(r, today, roomTypeMap = {}) {
   today = today || new Date().toISOString().slice(0, 10);
 
   const primaryGuest = (r.guests || []).find(g => g.is_primary) || r.guests?.[0] || {};
@@ -282,7 +336,11 @@ function mapReservationSummary(r, today) {
     notes = r.notes;
   }
 
+  const roomTypeId   = pickRoomTypeId(r);
+  const roomTypeCode = roomTypeId != null ? (roomTypeMap[roomTypeId] || null) : null;
+
   return {
+    // ── Existing iOS-compat fields (unchanged shape) ──
     id:                  String(r.id),
     confirmation_number: r.confirmation_number || `#${r.id}`,
     primary_guest_name:  guestName,
@@ -294,50 +352,115 @@ function mapReservationSummary(r, today) {
     children,
     status:              displayStatus,
     notes,
+
+    // ── New fields for the web staff portal ──
+    // Lodge-filter source — populated even when no room is assigned yet.
+    room_type_id:        roomTypeId,        // string id, or null
+    room_type_code:      roomTypeCode,      // e.g. "LKW", or null if unknown
+    // Channel signals — surfaced raw so the frontend can iterate on the
+    // 3-bucket privacy collapse (Direct via website / Direct via front
+    // desk / OTA channel) without redeploying the proxy.
+    segment_code:        r.segment_code     || null,
+    creator_login:       r.creator?.login   || null,
   };
 }
 
+// ── StayNTouch Proxy — shared middleware ─────────────────────────────────────
+//
+// Web staff portal hits these from a browser. The iOS app also hits them
+// (legacy path), so changes here must stay backward-compatible.
+//
+// Bearer auth: WEB_CLIENT_TOKEN in env. If unset, the check is bypassed
+// (preserves iOS behavior until the iOS app is updated to send the token).
+// When set, requests without a matching `Authorization: Bearer <token>`
+// get 401. This is a SPEED BUMP, not real auth — the token is shipped to
+// any browser that loads the staff portal. Real auth (e.g. Supabase JWT
+// validated proxy-side) is the eventual fix.
+const WEB_CLIENT_TOKEN = process.env.WEB_CLIENT_TOKEN || "";
+
+const STAFF_PORTAL_ORIGINS = [
+  "https://avalochstaff.xtiansampson.com",
+  "https://avalochstaff.com",
+  "http://localhost:5173",  // vite dev
+  "http://localhost:4173",  // vite preview
+];
+
+function requireWebToken(req, res, next) {
+  if (!WEB_CLIENT_TOKEN) return next();   // disabled → allow (iOS-compat)
+  const auth = req.headers["authorization"] || "";
+  const match = auth.match(/^Bearer\s+(.+)$/i);
+  const token = match ? match[1].trim() : "";
+  if (token !== WEB_CLIENT_TOKEN) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  next();
+}
+
+const sntRouter = express.Router();
+// CORS first so even 401 responses carry the right ACAO header for browser
+// fetches that need to read the body of the failure.
+sntRouter.use(cors({
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true);  // curl, server-to-server
+    if (STAFF_PORTAL_ORIGINS.includes(origin)) return cb(null, true);
+    return cb(null, false);
+  },
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Authorization", "Content-Type"],
+  maxAge: 86400,
+}));
+sntRouter.use(requireWebToken);
+
 // ── StayNTouch Proxy Routes ───────────────────────────────────────────────────
 
-// GET /stayntouch/reservations — active reservations, proxied from StayNTouch
-app.get("/stayntouch/reservations", async (req, res) => {
-  try {
-    const today = new Date().toISOString().slice(0, 10);
+const ISO_DATE_RX = /^\d{4}-\d{2}-\d{2}$/;
 
-    // Fetch all three status buckets in parallel
-    // SNT dashboard: Arrivals = RESERVED arriving today, Stayovers = CHECKEDIN, Departures = CHECKEDIN departing today
-    const [checkedInData, reservedData] = await Promise.all([
+function resolveDate(req) {
+  const raw = (req.query.date || "").trim();
+  if (raw && ISO_DATE_RX.test(raw)) return raw;
+  return new Date().toISOString().slice(0, 10);
+}
+
+// GET /stayntouch/reservations?date=YYYY-MM-DD — active reservations for a date
+sntRouter.get("/reservations", async (req, res) => {
+  try {
+    const date = resolveDate(req);
+
+    // SNT dashboard logic:
+    //   Arrivals  = RESERVED  where arrival_date  == date
+    //   Stayovers = CHECKEDIN where departure_date >  date
+    //   Departing = CHECKEDIN where departure_date == date
+    //
+    // SNT's `arrival_date` query string is unreliable in practice — we fetch
+    // both status buckets in full and filter locally. Cheap relative to the
+    // total per-day volume Avaloch sees.
+    const [checkedInData, reservedData, roomTypeMap] = await Promise.all([
       stayntouchGet(`/reservations?hotel_id=${STAYNTOUCH_HOTEL_ID}&status=CHECKEDIN`),
       stayntouchGet(`/reservations?hotel_id=${STAYNTOUCH_HOTEL_ID}&status=RESERVED`),
+      getRoomTypeMap(),
     ]);
 
     const checkedIn = (checkedInData.results || []);
     const reserved  = (reservedData.results  || []);
 
-    // Mirror SNT dashboard logic:
-    // - Arrivals  = RESERVED where arrival_date == today
-    // - Stayovers = CHECKEDIN where departure_date > today
-    // - Departing = CHECKEDIN where departure_date == today
-    const arrivals  = reserved.filter(r => r.arrival_date  === today);
-    const stayovers = checkedIn.filter(r => r.departure_date >  today);
-    const departing = checkedIn.filter(r => r.departure_date === today);
+    const arrivals  = reserved.filter(r => r.arrival_date  === date);
+    const stayovers = checkedIn.filter(r => r.departure_date >  date);
+    const departing = checkedIn.filter(r => r.departure_date === date);
 
-    const allResults = [...arrivals, ...stayovers, ...departing];
-
-    // Deduplicate by id
+    // Dedupe by id (a single reservation can land in multiple buckets in
+    // edge cases, e.g. same-day arrival+departure)
     const seen = new Set();
-    const unique = allResults.filter(r => {
+    const unique = [...arrivals, ...stayovers, ...departing].filter(r => {
       if (seen.has(r.id)) return false;
       seen.add(r.id);
       return true;
     });
 
-    const reservations = unique.map(r => mapReservationSummary(r, today));
+    const reservations = unique.map(r => mapReservationSummary(r, date, roomTypeMap));
 
-    // Log summary to match SNT dashboard for debugging
-    console.log(`[StayNTouch] Reservations for ${today}: ${arrivals.length} arriving, ${stayovers.length} stayovers, ${departing.length} departing`);
+    console.log(`[StayNTouch] Reservations for ${date}: ${arrivals.length} arriving, ${stayovers.length} stayovers, ${departing.length} departing`);
 
-    res.json({ reservations });
+    res.json({ reservations, date });
   } catch (e) {
     console.error("[StayNTouch] /reservations error:", e.message);
     res.status(500).json({ error: e.message });
@@ -348,7 +471,7 @@ app.get("/stayntouch/reservations", async (req, res) => {
 // SNT's /reservations endpoint appears to require a `status` filter (without it,
 // results are empty). We query all relevant status buckets in parallel, merge,
 // dedupe, and filter locally by last name.
-app.get("/stayntouch/reservations/search", async (req, res) => {
+sntRouter.get("/reservations/search", async (req, res) => {
   try {
     const lastName = (req.query.lastName || "").trim();
     if (lastName.length < 2) {
@@ -360,16 +483,17 @@ app.get("/stayntouch/reservations/search", async (req, res) => {
     // Query each status bucket in parallel. SNT requires `status` to return results.
     // CHECKEDOUT can be high-volume so we cap per_page aggressively.
     const statuses = ["CHECKEDIN", "RESERVED", "CHECKEDOUT"];
-    const bucketResults = await Promise.all(
-      statuses.map(s =>
+    const [bucketResults, roomTypeMap] = await Promise.all([
+      Promise.all(statuses.map(s =>
         stayntouchGet(`/reservations?hotel_id=${STAYNTOUCH_HOTEL_ID}&status=${s}&per_page=50`)
           .then(data => ({ status: s, results: data.results || [] }))
           .catch(err => {
             console.warn(`[StayNTouch] Search: failed to fetch ${s}: ${err.message}`);
             return { status: s, results: [] };
           })
-      )
-    );
+      )),
+      getRoomTypeMap(),
+    ]);
 
     // Merge + dedupe by id
     const seen = new Set();
@@ -401,7 +525,7 @@ app.get("/stayntouch/reservations/search", async (req, res) => {
       return aDist - bDist;
     });
 
-    const reservations = matches.map(r => mapReservationSummary(r, today));
+    const reservations = matches.map(r => mapReservationSummary(r, today, roomTypeMap));
 
     const bucketBreakdown = bucketResults.map(b => `${b.status}:${b.results.length}`).join(" ");
     console.log(`[StayNTouch] Search "${lastName}": buckets(${bucketBreakdown}) = ${all.length} unique, matched ${matches.length}`);
@@ -418,7 +542,7 @@ app.get("/stayntouch/reservations/search", async (req, res) => {
 });
 
 // GET /stayntouch/reservations/:id — full reservation detail, passed through raw
-app.get("/stayntouch/reservations/:id", async (req, res) => {
+sntRouter.get("/reservations/:id", async (req, res) => {
   try {
     const id = req.params.id;
     if (!/^\d+$/.test(id)) {
@@ -432,21 +556,29 @@ app.get("/stayntouch/reservations/:id", async (req, res) => {
   }
 });
 
-// GET /stayntouch/rooms — room statuses, proxied from StayNTouch
-app.get("/stayntouch/rooms", async (req, res) => {
+// GET /stayntouch/rooms — room statuses, proxied from StayNTouch and enriched
+// with the human-readable room_type_code from the catalog.
+sntRouter.get("/rooms", async (req, res) => {
   try {
-    const data = await stayntouchGet(`/rooms?hotel_id=${STAYNTOUCH_HOTEL_ID}`);
+    const [data, roomTypeMap] = await Promise.all([
+      stayntouchGet(`/rooms?hotel_id=${STAYNTOUCH_HOTEL_ID}`),
+      getRoomTypeMap(),
+    ]);
     const rawRooms = data.results || data.rooms || data || [];
 
-    const rooms = rawRooms.map(r => ({
-      id:             String(r.id || r.number),
-      room_number:    r.number         || r.room_number || "—",
-      room_type_id:   r.room_type_id   ? String(r.room_type_id) : "—",
-      floor:          r.floor?.number  || null,
-      status:         r.status         || null,   // CLEAN, DIRTY, INSPECTED, etc.
-      service_status: r.service_status || null,   // IN_SERVICE, OUT_OF_SERVICE
-      occupied:       r.occupied       ?? false,
-    }));
+    const rooms = rawRooms.map(r => {
+      const roomTypeId = r.room_type_id != null ? String(r.room_type_id) : null;
+      return {
+        id:             String(r.id || r.number),
+        room_number:    r.number         || r.room_number || "—",
+        room_type_id:   roomTypeId       || "—",                // iOS-compat
+        room_type_code: roomTypeId ? (roomTypeMap[roomTypeId] || null) : null,
+        floor:          r.floor?.number  || null,
+        status:         r.status         || null,   // CLEAN, DIRTY, INSPECTED, etc.
+        service_status: r.service_status || null,   // IN_SERVICE, OUT_OF_SERVICE
+        occupied:       r.occupied       ?? false,
+      };
+    });
 
     const occupiedCount = rooms.filter(r => r.occupied).length;
     const totalCount    = rooms.length;
@@ -458,6 +590,23 @@ app.get("/stayntouch/rooms", async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
+// GET /stayntouch/room_types — the room-type catalog. Useful for any future
+// widget that wants to render id→code mappings or list available types.
+sntRouter.get("/room_types", async (req, res) => {
+  try {
+    const data = await stayntouchGet(`/hotels/${STAYNTOUCH_HOTEL_ID}/room_types`);
+    const list = data.results || data || [];
+    res.json({ room_types: list });
+  } catch (e) {
+    console.error("[StayNTouch] /room_types error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Mount the router. Adding a new SNT-backed endpoint is one route registration
+// on sntRouter — auth, CORS, and base path are handled by the middleware above.
+app.use("/stayntouch", sntRouter);
 
 // ── StayNTouch Webhook Handler ────────────────────────────────────────────────
 
