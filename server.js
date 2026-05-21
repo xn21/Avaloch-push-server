@@ -467,6 +467,48 @@ sntRouter.get("/reservations", async (req, res) => {
   }
 });
 
+// GET /stayntouch/reservations/summary?date=YYYY-MM-DD
+//
+// Lightweight today-feed for the staff portal's Live Operations widget.
+// Per Maria @ SNT (cert review), polling /connect/reservations is too
+// resource-intensive on their side; /connect/reservations/summary is the
+// purpose-built endpoint for the today-view use case. Single SNT call,
+// no status-bucket gymnastics, no per-status pagination.
+//
+// Response shape mirrors /stayntouch/reservations ({ reservations, date })
+// so the frontend swap is a one-line method-name change. Rows are run
+// through mapReservationSummary for shape parity — any field the summary
+// payload omits comes back null, the iOS-compat fields stay populated
+// where present.
+//
+// TODO(christian): confirm the exact SNT-side query param name once
+// recon curl has been run against UAT — best guess is `date`, but it
+// may be `business_date` / `arrival_date` / nothing-at-all (the endpoint
+// might already default to today). See SESSION_NOTES recon block.
+sntRouter.get("/reservations/summary", async (req, res) => {
+  try {
+    const date = resolveDate(req);
+
+    const [data, roomTypeMap] = await Promise.all([
+      stayntouchGet(`/reservations/summary?hotel_id=${STAYNTOUCH_HOTEL_ID}&date=${date}`),
+      getRoomTypeMap(),
+    ]);
+
+    // SNT's list endpoints generally return rows under `results`; some
+    // variants use `reservations`. Accept either, default to empty.
+    const raw = data.results || data.reservations || [];
+
+    const reservations = raw.map(r => mapReservationSummary(r, date, roomTypeMap));
+
+    console.log(`[StayNTouch] Reservations summary for ${date}: ${reservations.length} rows`);
+
+    res.json({ reservations, date });
+  } catch (e) {
+    console.error("[StayNTouch] /reservations/summary error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // GET /stayntouch/reservations/search?lastName=X — reservation lookup by last name
 // SNT's /reservations endpoint appears to require a `status` filter (without it,
 // results are empty). We query all relevant status buckets in parallel, merge,
