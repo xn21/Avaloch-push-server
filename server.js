@@ -480,11 +480,6 @@ sntRouter.get("/reservations", async (req, res) => {
 // through mapReservationSummary for shape parity — any field the summary
 // payload omits comes back null, the iOS-compat fields stay populated
 // where present.
-//
-// TODO(christian): confirm the exact SNT-side query param name once
-// recon curl has been run against UAT — best guess is `date`, but it
-// may be `business_date` / `arrival_date` / nothing-at-all (the endpoint
-// might already default to today). See SESSION_NOTES recon block.
 sntRouter.get("/reservations/summary", async (req, res) => {
   try {
     const date = resolveDate(req);
