@@ -84,6 +84,38 @@ params (`checked_in`, `date`/`date_filter`, etc.).
 
 - `node -c server.js` — **clean.**
 
-## Confirmed (filled in post-deploy)
+## Confirmed (post-deploy, against live production data, HOTEL_ID 630)
 
-_Pending — populated after Render auto-deploy + verification curls._
+Deploy SHA `804fae6`. Verified via curl against the live Render proxy. Only
+confirmation_number + status logged (no guest PII).
+
+1. **Prefix matching: CONFIRMED.** `lastName=Brown` returned "Browne" (CONF #112382,
+   RESERVED) at the top of the results. So `query` does partial/prefix matching as the
+   spec documents — this is exactly why `query` was chosen over `last_name`.
+2. **No status filter required: CONFIRMED.** `query` + `hotel_id` alone returned
+   matches with no `status` param, spanning RESERVED / CHECKEDOUT / CANCELED / NOSHOW.
+
+Acceptance curls:
+
+- **Catino** → 2 rows, incl. **CONF #112254 (RESERVED)** — the search-window bug is
+  fixed; the previously-missing reservation now appears. (Also #111486, CHECKEDOUT.)
+- **Tester** → 1 row (CONF #109840, NOSHOW). ≥1 row, no regression. NOTE: this is a
+  different conf# than the brief's #106744 — #106744 appears to be UAT-era data not
+  present in production. (Catino #112254 matched the brief exactly, confirming live
+  prod data.) Also note the matched Tester is a NOSHOW, a status the OLD 3-bucket code
+  never queried — so the old code would have returned it as 0 rows. The new behavior
+  is strictly more complete here.
+- **Browne** (full surname) → 10 rows, not truncated, #112382 (RESERVED) first.
+
+### Two behavior characteristics worth knowing (not bugs)
+
+- **Common prefixes can truncate at the 50-row cap.** `lastName=Brown` returned 50 rows
+  with `truncated=True`, because `query` matches across last name, first name, city, and
+  email of every guest — "brown" is a common substring. The relevant reservation still
+  surfaces first via the closest-to-today sort, but for a genuinely common prefix the
+  tail is cut off. Acceptable for a click-driven search; if it ever bites, the fix is
+  pagination (loop `page=1,2,…`) or switching that case to the stricter `last_name`.
+- **Search now includes CANCELED and NOSHOW reservations.** The old code only queried
+  CHECKEDIN / RESERVED / CHECKEDOUT buckets; `query` is status-agnostic. This is the
+  intended "catch everything" behavior, but staff will now see cancelled/no-show
+  reservations in search results where they previously wouldn't.
