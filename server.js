@@ -523,10 +523,21 @@ sntRouter.get("/reservations/summary", async (req, res) => {
   }
 });
 
-// GET /stayntouch/reservations/search?lastName=X — reservation lookup by last name
-// SNT's /reservations endpoint appears to require a `status` filter (without it,
-// results are empty). We query all relevant status buckets in parallel, merge,
-// dedupe, and filter locally by last name.
+// GET /stayntouch/reservations/search?lastName=X — reservation lookup by surname.
+//
+// Design (2026-06-01): server-side search via SNT's documented `query` param on
+// /connect/reservations. `query` matches across guest fields (last/first name —
+// full or first-letters prefix — plus city/email) and is NOT scoped to a status
+// bucket, so it finds reservations regardless of recency or status. This replaces
+// the previous approach (fan out CHECKEDIN/RESERVED/CHECKEDOUT at per_page=50, then
+// filter last-name client-side), which silently dropped any reservation outside the
+// most-recent 50 rows of each bucket — the search-window bug (e.g. CONF #112254
+// never reached the filter).
+//
+// Why `query` over the dedicated `last_name` param: front desk needs partial-surname
+// lookups ("Brown" -> "Browne"), and `query` documents prefix matching while
+// `last_name`'s match mode is unverified. The cost — `query` also matching city/email
+// — is acceptable: the result-click verify flow lets staff confirm the right person.
 sntRouter.get("/reservations/search", async (req, res) => {
   try {
     const lastName = (req.query.lastName || "").trim();
@@ -536,43 +547,14 @@ sntRouter.get("/reservations/search", async (req, res) => {
 
     const today = new Date().toISOString().slice(0, 10);
 
-    // Query each status bucket in parallel. SNT requires `status` to return results.
-    // CHECKEDOUT can be high-volume so we cap per_page aggressively.
-    const statuses = ["CHECKEDIN", "RESERVED", "CHECKEDOUT"];
-    const [bucketResults, roomTypeMap] = await Promise.all([
-      Promise.all(statuses.map(s =>
-        stayntouchGet(`/reservations?hotel_id=${STAYNTOUCH_HOTEL_ID}&status=${s}&per_page=50`)
-          .then(data => ({ status: s, results: data.results || [] }))
-          .catch(err => {
-            console.warn(`[StayNTouch] Search: failed to fetch ${s}: ${err.message}`);
-            return { status: s, results: [] };
-          })
-      )),
+    // Single upstream call: SNT does the search server-side. per_page=50 is SNT's
+    // documented maximum; a surname realistically returns far fewer.
+    const [data, roomTypeMap] = await Promise.all([
+      stayntouchGet(`/reservations?hotel_id=${STAYNTOUCH_HOTEL_ID}&query=${encodeURIComponent(lastName)}&per_page=50`),
       getRoomTypeMap(),
     ]);
 
-    // Merge + dedupe by id
-    const seen = new Set();
-    const all = [];
-    for (const bucket of bucketResults) {
-      for (const r of bucket.results) {
-        if (!seen.has(r.id)) {
-          seen.add(r.id);
-          all.push(r);
-        }
-      }
-    }
-
-    // Local filter: case-insensitive match against:
-    // (1) any guest's last_name, or
-    // (2) the primary_guest_name string (catches edge cases like "Jon Snow(SALIDO)")
-    const lower = lastName.toLowerCase();
-    const matches = all.filter(r => {
-      const guests = r.guests || [];
-      const guestLastMatch = guests.some(g => (g.last_name || "").toLowerCase().includes(lower));
-      const primaryNameMatch = (r.primary_guest_name || "").toLowerCase().includes(lower);
-      return guestLastMatch || primaryNameMatch;
-    });
+    const matches = data.results || [];
 
     // Sort: most relevant first — reservations closest to today
     matches.sort((a, b) => {
@@ -583,13 +565,13 @@ sntRouter.get("/reservations/search", async (req, res) => {
 
     const reservations = matches.map(r => mapReservationSummary(r, today, roomTypeMap));
 
-    const bucketBreakdown = bucketResults.map(b => `${b.status}:${b.results.length}`).join(" ");
-    console.log(`[StayNTouch] Search "${lastName}": buckets(${bucketBreakdown}) = ${all.length} unique, matched ${matches.length}`);
+    console.log(`[StayNTouch] Search "${lastName}": ${matches.length} match(es) via query param`);
 
     res.json({
       reservations,
       total: matches.length,
-      truncated: all.length >= 150, // rough upper bound (3 buckets * 50)
+      // True only if we hit the page cap — there may be more beyond page 1.
+      truncated: matches.length >= 50,
     });
   } catch (e) {
     console.error("[StayNTouch] /reservations/search error:", e.message);
