@@ -297,6 +297,7 @@ function pickRoomTypeId(r) {
   if (r.room?.room_type_id != null) return String(r.room.room_type_id);
   const sd = (r.stay_dates || [])[0];
   if (sd?.room_type_id != null) return String(sd.room_type_id);
+  if (r.room_type_id != null) return String(r.room_type_id);   // SNT summary's flat row-level field
   return null;
 }
 
@@ -310,10 +311,17 @@ function pickRoomTypeId(r) {
 function mapReservationSummary(r, today, roomTypeMap = {}) {
   today = today || new Date().toISOString().slice(0, 10);
 
+  // Guest name resolution handles BOTH SNT shapes:
+  //   1. Full /reservations: nested guests[] with first_name/last_name.
+  //   2. /reservations/summary: flat row-level first_name/last_name.
+  // Nested path stays FIRST (full-endpoint behavior unchanged); flat path is
+  // the summary fallback; r.primary_guest_name (a flat string SNT sometimes
+  // sends) then the "Guest" placeholder remain as final fallbacks.
   const primaryGuest = (r.guests || []).find(g => g.is_primary) || r.guests?.[0] || {};
+  const flatGuestName = [r.first_name, r.last_name].filter(Boolean).join(" ").trim();
   const guestName = primaryGuest.first_name && primaryGuest.last_name
     ? `${primaryGuest.first_name} ${primaryGuest.last_name}`
-    : (r.primary_guest_name || "Guest");
+    : (flatGuestName || r.primary_guest_name || "Guest");
   const stayDate = (r.stay_dates || [])[0] || {};
   const adults   = stayDate.adults   ?? r.adults   ?? 1;
   const children = stayDate.children ?? r.children ?? 0;
@@ -339,13 +347,22 @@ function mapReservationSummary(r, today, roomTypeMap = {}) {
   const roomTypeId   = pickRoomTypeId(r);
   const roomTypeCode = roomTypeId != null ? (roomTypeMap[roomTypeId] || null) : null;
 
+  // Room number: nested room.number (full /reservations) FIRST, then SNT
+  // summary's flat room_id, then the "—" placeholder.
+  // TODO(christian): summary's room_id is an internal SNT room identifier, not
+  // the guest-facing room number ("504") the full endpoint returns. Surfaced
+  // as-is for now because it beats "—"; to render a display-friendly number it
+  // likely needs joining against the rooms inventory (a rooms-id->number cache,
+  // analogous to roomTypeMap). Not plumbed this session.
+  const roomNumber = r.room?.number || (r.room_id != null ? String(r.room_id) : "—");
+
   return {
     // ── Existing iOS-compat fields (unchanged shape) ──
     id:                  String(r.id),
     confirmation_number: r.confirmation_number || `#${r.id}`,
     primary_guest_name:  guestName,
-    room_number:         r.room?.number         || "—",
-    room_type:           r.room?.room_type_id   ? String(r.room.room_type_id) : "—",
+    room_number:         roomNumber,
+    room_type:           r.room?.room_type_id   ? String(r.room.room_type_id) : (roomTypeId || "—"),
     arrival_date:        r.arrival_date,
     departure_date:      r.departure_date,
     adults,
