@@ -376,9 +376,11 @@ function mapReservationSummary(r, today, roomTypeMap = {}) {
     room_type_code:      roomTypeCode,      // e.g. "LKW", or null if unknown
     // Channel signals — surfaced raw so the frontend can iterate on the
     // 3-bucket privacy collapse (Direct via website / Direct via front
-    // desk / OTA channel) without redeploying the proxy.
+    // desk / OTA channel) without redeploying the proxy. source_code is
+    // what disambiguates SiteMinder pushes: "Hotel Website" vs an OTA name.
     segment_code:        r.segment_code     || null,
     creator_login:       r.creator?.login   || null,
+    source_code:         r.source_code      || null,
   };
 }
 
@@ -602,8 +604,39 @@ sntRouter.get("/reservations/:id", async (req, res) => {
     if (!/^\d+$/.test(id)) {
       return res.status(400).json({ error: "Invalid reservation id" });
     }
-    const data = await stayntouchGet(`/reservations/${id}?hotel_id=${STAYNTOUCH_HOTEL_ID}`);
-    res.json(data);
+    const [data, roomTypeMap] = await Promise.all([
+      stayntouchGet(`/reservations/${id}?hotel_id=${STAYNTOUCH_HOTEL_ID}`),
+      getRoomTypeMap(),
+    ]);
+
+    // Unlike /summary and /search, this detail endpoint passes the raw SNT
+    // payload through rather than running it through mapReservationSummary,
+    // so the two normalizations below are duplicated inline here.
+    // TODO(christian): the stay_dates departure-drop and the room_type_id ->
+    // room_type_code lookup mirror logic in mapReservationSummary / pickRoomTypeId.
+    // Left duplicated for now (the detail view consumes the full raw payload,
+    // not the compact mapped shape); extract a shared helper if a third
+    // consumer appears.
+
+    // SNT appends the departure date as the final stay_dates entry — needed by
+    // hourly-rate hotels, spurious for nightly-rate Avaloch (it double-counts a
+    // night in the frontend's totals/nights math). Drop it. Build a new object;
+    // don't mutate the SNT response.
+    const filteredStayDates = (data.stay_dates || []).filter(sd => sd.date !== data.departure_date);
+
+    // Room type: the detail payload carries stay_dates[].room_type_id (an integer
+    // like 8766), not a display code. Resolve the first stay date's id against the
+    // same id->code cache the summary feed uses; null on cache miss.
+    const detailRoomTypeId = filteredStayDates[0]?.room_type_id ?? data.stay_dates?.[0]?.room_type_id;
+    const detailRoomTypeCode = detailRoomTypeId != null
+      ? (roomTypeMap[String(detailRoomTypeId)] || null)
+      : null;
+
+    res.json({
+      ...data,
+      stay_dates:     filteredStayDates,
+      room_type_code: detailRoomTypeCode,
+    });
   } catch (e) {
     console.error(`[StayNTouch] /reservations/${req.params.id} error:`, e.message);
     res.status(500).json({ error: e.message });
