@@ -405,7 +405,16 @@ const STAFF_PORTAL_ORIGINS = [
 ];
 
 function requireWebToken(req, res, next) {
-  if (!WEB_CLIENT_TOKEN) return next();   // disabled → allow (iOS-compat)
+  // FAIL CLOSED: if no server-side secret is configured, reject every request.
+  // This previously did `return next()` (an iOS-compat bypass), which made the
+  // guard a no-op whenever WEB_CLIENT_TOKEN was missing/empty on the host — that
+  // left all /stayntouch and /ringcentral data routes (guest PII, call logs)
+  // publicly readable. A missing secret is an operator misconfiguration, so we
+  // 503 (and log) rather than expose data.
+  if (!WEB_CLIENT_TOKEN) {
+    console.error("[auth] WEB_CLIENT_TOKEN is not set — rejecting all proxy requests (fail closed). Set WEB_CLIENT_TOKEN on the host.");
+    return res.status(503).json({ error: "Server auth not configured" });
+  }
   const auth = req.headers["authorization"] || "";
   const match = auth.match(/^Bearer\s+(.+)$/i);
   const token = match ? match[1].trim() : "";
