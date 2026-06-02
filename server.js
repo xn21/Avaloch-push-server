@@ -677,6 +677,269 @@ sntRouter.get("/room_types", async (req, res) => {
 // on sntRouter — auth, CORS, and base path are handled by the middleware above.
 app.use("/stayntouch", sntRouter);
 
+// ── RingCentral Proxy ─────────────────────────────────────────────────────────
+//
+// Mediates RingCentral API calls so the JWT / client secret NEVER reach the SPA.
+// The staff portal's Comms widget hits these from the browser; credentials live
+// only in this server's env. Same auth/CORS posture as the SNT router (reuses
+// requireWebToken + STAFF_PORTAL_ORIGINS).
+//
+// Auth model: a private RingCentral app with JWT credentials. We exchange the
+// long-lived JWT for a short-lived access token (jwt-bearer grant) server-side,
+// cache it until just before expiry, and refresh on demand. No credential is
+// ever sent to the client.
+//
+// Env (set on the Render service — DO NOT hardcode):
+//   RC_JWT             — the app's JWT credential (long-lived assertion)
+//   RC_CLIENT_ID       — RingCentral app client id
+//   RC_CLIENT_SECRET   — RingCentral app client secret
+//   RC_SERVER_URL      — platform base, e.g. https://platform.ringcentral.com
+//                        (production) or https://platform.devtest.ringcentral.com
+//   RC_FRONTDESK_EXT_ID — the single front-desk extension whose SMS/Text store
+//                        the /messages route pulls (see that route's header for
+//                        how to resolve the id once from the 413-637-1910 line)
+const RC_SERVER_URL      = (process.env.RC_SERVER_URL || "https://platform.ringcentral.com").replace(/\/$/, "");
+const RC_JWT             = process.env.RC_JWT;
+const RC_CLIENT_ID       = process.env.RC_CLIENT_ID;
+const RC_CLIENT_SECRET   = process.env.RC_CLIENT_SECRET;
+const RC_FRONTDESK_EXT_ID = process.env.RC_FRONTDESK_EXT_ID;
+
+console.log(`[RingCentral] Boot config:
+  Server URL:     ${RC_SERVER_URL}
+  JWT set:        ${!!RC_JWT}
+  Client ID set:  ${!!RC_CLIENT_ID}
+  Secret set:     ${!!RC_CLIENT_SECRET}
+  Frontdesk ext:  ${RC_FRONTDESK_EXT_ID || "not set"}`);
+
+// ── RingCentral token cache (jwt-bearer grant, auto-refreshes) ───────────────
+let ringcentralToken = { value: null, expiresAt: 0 };
+
+async function getRingcentralToken() {
+  // Serve cached token while it has >5min of life left.
+  if (ringcentralToken.value && Date.now() < ringcentralToken.expiresAt - 5 * 60 * 1000) {
+    return ringcentralToken.value;
+  }
+  if (!RC_JWT || !RC_CLIENT_ID || !RC_CLIENT_SECRET) {
+    throw new Error("Missing RC_JWT / RC_CLIENT_ID / RC_CLIENT_SECRET");
+  }
+  console.log("[RingCentral] Refreshing access token (jwt-bearer)...");
+  const basic = Buffer.from(`${RC_CLIENT_ID}:${RC_CLIENT_SECRET}`).toString("base64");
+  const body = new URLSearchParams({
+    grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+    assertion:  RC_JWT,
+  });
+  const response = await fetch(`${RC_SERVER_URL}/restapi/oauth/token`, {
+    method: "POST",
+    headers: {
+      Authorization: `Basic ${basic}`,
+      "Content-Type": "application/x-www-form-urlencoded",
+      Accept: "application/json",
+    },
+    body,
+  });
+  if (!response.ok) {
+    const errText = await response.text().catch(() => "");
+    console.error(`[RingCentral] Token refresh failed: ${response.status} — ${errText.substring(0, 200)}`);
+    throw new Error(`RingCentral token refresh failed: ${response.status}`);
+  }
+  const data = await response.json();
+  ringcentralToken = {
+    value:     data.access_token,
+    expiresAt: Date.now() + (data.expires_in * 1000),
+  };
+  console.log(`[RingCentral] Token refreshed, expires in ${Math.round(data.expires_in / 60)}m`);
+  return ringcentralToken.value;
+}
+
+// GET against RingCentral. Accepts a relative path OR an absolute URL (the
+// pagination `navigation.nextPage.uri` comes back absolute). A 404 is surfaced
+// as an Error with `.status = 404` so the insights route can map it to a null
+// insight instead of a 500 — many records legitimately have no insights, and
+// the RingSense scope may be absent entirely.
+async function ringcentralGet(pathOrUrl) {
+  const token = await getRingcentralToken();
+  const url = pathOrUrl.startsWith("http") ? pathOrUrl : `${RC_SERVER_URL}${pathOrUrl}`;
+  const response = await fetch(url, {
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+  });
+  if (!response.ok) {
+    const err = new Error(`RingCentral API error: ${response.status} ${url}`);
+    err.status = response.status;
+    throw err;
+  }
+  return response.json();
+}
+
+// Walk every page of a RingCentral list endpoint. RC paginates via
+// `navigation.nextPage.uri` (an absolute URL); we follow it until it's absent.
+// The guard caps total pages so a malformed response can never spin forever.
+async function ringcentralGetAllPages(initialPath) {
+  const out = [];
+  let next = initialPath;
+  let guard = 0;
+  while (next && guard < 200) {
+    guard++;
+    const data = await ringcentralGet(next);
+    if (Array.isArray(data.records)) out.push(...data.records);
+    next = data.navigation?.nextPage?.uri || null;
+  }
+  return out;
+}
+
+// ── RingCentral normalizers — map raw RC records to the SPA's upsert shape ───
+
+// Detailed call-log record → rc_calls row. `recording.id` is the RingSense
+// sourceRecordId used for AI insights; null when the call wasn't recorded.
+function mapCallRecord(r) {
+  return {
+    session_id:           r.sessionId,
+    telephony_session_id: r.telephonySessionId || null,
+    start_time:           r.startTime || null,
+    duration_sec:         r.duration ?? null,
+    direction:            r.direction || null,
+    result:               r.result || null,      // raw RC value, not normalized
+    from_number:          r.from?.phoneNumber || null,
+    from_name:            r.from?.name || null,
+    to_number:            r.to?.phoneNumber || null,
+    to_name:              r.to?.name || null,
+    recording_id:         r.recording?.id || null,
+    raw:                  r,
+  };
+}
+
+// message-store record → rc_messages row. `to` is an array (SMS can have
+// multiple recipients) so it's preserved whole. `extensionId` is the store we
+// pulled it from, threaded through by the caller.
+function mapMessageRecord(r, extensionId) {
+  return {
+    id:              String(r.id),
+    conversation_id: r.conversation?.id != null ? String(r.conversation.id) : null,
+    message_type:    r.type || null,             // SMS / Text / Pager (raw RC)
+    direction:       r.direction || null,
+    creation_time:   r.creationTime || null,
+    from_number:     r.from?.phoneNumber || null,
+    to_number:       r.to || null,               // array of recipient objects
+    subject:         r.subject || null,          // SMS body
+    read_status:     r.readStatus || null,
+    extension_id:    extensionId != null ? String(extensionId) : null,
+    raw:             r,
+  };
+}
+
+const rcRouter = express.Router();
+// CORS first so even a 401 carries the right ACAO header for browser fetches.
+rcRouter.use(cors({
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true);  // curl, server-to-server
+    if (STAFF_PORTAL_ORIGINS.includes(origin)) return cb(null, true);
+    return cb(null, false);
+  },
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Authorization", "Content-Type"],
+  maxAge: 86400,
+}));
+rcRouter.use(requireWebToken);
+
+// GET /ringcentral/call-log?since=<iso> — account-level Detailed call log.
+//
+// Account-scope (admin auth) so it covers every extension in one pass.
+// Paginates fully (follows navigation.nextPage.uri) — does NOT stop at page 1.
+// Returns normalized records ready for upsert on session_id.
+//
+//   curl -H "Authorization: Bearer $WEB_CLIENT_TOKEN" \
+//     "https://avaloch-push-server.onrender.com/ringcentral/call-log?since=2026-06-01T00:00:00.000Z"
+rcRouter.get("/call-log", async (req, res) => {
+  try {
+    const since = (req.query.since || "").trim();
+    const params = new URLSearchParams({ view: "Detailed", perPage: "1000" });
+    if (since) params.set("dateFrom", since);
+    const records = await ringcentralGetAllPages(
+      `/restapi/v1.0/account/~/call-log?${params.toString()}`
+    );
+    const calls = records.map(mapCallRecord);
+    console.log(`[RingCentral] call-log since ${since || "(none)"}: ${calls.length} record(s)`);
+    res.json({ calls, total: calls.length, since: since || null });
+  } catch (e) {
+    console.error("[RingCentral] /call-log error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /ringcentral/messages?since=<iso> — front-desk SMS/Text.
+//
+// Single-extension by design: Avaloch's texts run through one front-desk line
+// (413-637-1910). The extension is SERVER-owned via env RC_FRONTDESK_EXT_ID —
+// the SPA does not choose extensions. No extensionIds param.
+//
+// Resolving RC_FRONTDESK_EXT_ID once (then set it on Render — do NOT hardcode):
+//   1. Get an access token (jwt-bearer, as getRingcentralToken does).
+//   2. List extensions and find the one bound to the front-desk number:
+//        curl -H "Authorization: Bearer <access_token>" \
+//          "$RC_SERVER_URL/restapi/v1.0/account/~/extension?perPage=1000"
+//      Match the record whose phoneNumbers[].phoneNumber (or contact.businessPhone)
+//      normalizes to +14136371910, and copy its `id`.
+//   3. Set RC_FRONTDESK_EXT_ID=<that id> on the Render service.
+// TODO(christian): resolved id NOT filled in here — resolving it needs a live
+// RingCentral call with valid creds, which this build session can't make. Run
+// the curl above once and paste the id into the Render env.
+//
+//   curl -H "Authorization: Bearer $WEB_CLIENT_TOKEN" \
+//     "https://avaloch-push-server.onrender.com/ringcentral/messages?since=2026-06-01T00:00:00.000Z"
+rcRouter.get("/messages", async (req, res) => {
+  try {
+    if (!RC_FRONTDESK_EXT_ID) {
+      return res.status(500).json({ error: "Missing RC_FRONTDESK_EXT_ID" });
+    }
+    const since = (req.query.since || "").trim();
+    const params = new URLSearchParams({ messageType: "SMS,Text", perPage: "1000" });
+    if (since) params.set("dateFrom", since);
+    const records = await ringcentralGetAllPages(
+      `/restapi/v1.0/account/~/extension/${encodeURIComponent(RC_FRONTDESK_EXT_ID)}/message-store?${params.toString()}`
+    );
+    const messages = records.map(r => mapMessageRecord(r, RC_FRONTDESK_EXT_ID));
+
+    console.log(`[RingCentral] messages since ${since || "(none)"} ext ${RC_FRONTDESK_EXT_ID}: ${messages.length} record(s)`);
+    res.json({ messages, total: messages.length, since: since || null });
+  } catch (e) {
+    console.error("[RingCentral] /messages error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /ringcentral/insights/:sourceRecordId — RingSense AI insight for one call.
+//
+// sourceRecordId is the call's recording.id (from the Detailed call-log).
+// Returns { sourceRecordId, insight } where `insight` is the raw RingSense
+// payload, or null when none exists. A 404 / "Resource not found" is mapped to
+// a null insight (HTTP 200) — NOT a 500 — because most records have no insight
+// and the RingSense scope may not be granted on the app at all.
+//
+// TODO(christian): confirm the RingSense scope is enabled on the RingCentral
+// app. Until it is, expect every call here to 404 and return null — the widget
+// stays fully functional without insights.
+//
+//   curl -H "Authorization: Bearer $WEB_CLIENT_TOKEN" \
+//     "https://avaloch-push-server.onrender.com/ringcentral/insights/ABC123"
+rcRouter.get("/insights/:sourceRecordId", async (req, res) => {
+  const sourceRecordId = req.params.sourceRecordId;
+  try {
+    const insight = await ringcentralGet(
+      `/ai/ringsense/v1/public/accounts/~/domains/pbx/records/${encodeURIComponent(sourceRecordId)}/insights`
+    );
+    res.json({ sourceRecordId, insight });
+  } catch (e) {
+    if (e.status === 404) {
+      // No insight for this record (or scope absent) — not an error condition.
+      return res.json({ sourceRecordId, insight: null });
+    }
+    console.error(`[RingCentral] /insights/${sourceRecordId} error:`, e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Mount the router. Same one-registration-per-route pattern as sntRouter.
+app.use("/ringcentral", rcRouter);
+
 // ── StayNTouch Webhook Handler ────────────────────────────────────────────────
 
 // Events that carry enough info in the payload — no callback needed
