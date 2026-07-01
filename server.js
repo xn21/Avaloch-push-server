@@ -588,6 +588,65 @@ sntRouter.get("/reservations/search", async (req, res) => {
   }
 });
 
+// GET /stayntouch/reservations/active — the FULL active-reservation union
+// (CHECKEDIN + RESERVED) with NO per-day filtering.
+//
+// Purpose: forward-looking availability math (the staff portal's Waitlist
+// sold-out calendar). /stayntouch/reservations fetches these same two status
+// buckets but then discards everything except a single requested date; this
+// route returns the whole union so the client can expand each stay into nights
+// and compute per-night occupancy in ONE round trip — instead of ~30 per-day
+// calls to hydrate a month, which SNT flagged as too heavy to poll (the reason
+// /summary exists). Reuses the exact SNT calls /reservations already makes: no
+// new SNT endpoint, no cert-scope change. Cancellations / no-shows are excluded
+// by construction (only CHECKEDIN + RESERVED are fetched).
+//
+// MUST be registered before "/reservations/:id" — that route 400s on a
+// non-numeric id, so "active" would otherwise be swallowed by it.
+//
+// Each row is mapReservationSummary-shaped for parity with the other feeds. The
+// fields that matter for occupancy: arrival_date + departure_date (a stay
+// occupies night N iff arrival_date <= N < departure_date — nightly convention,
+// departure morning is not an occupied night), room_number (assigned rooms carry
+// the real number e.g. "105"; unassigned future reservations carry "—"), and
+// room_type_code.
+sntRouter.get("/reservations/active", async (req, res) => {
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+
+    const [checkedInData, reservedData, roomTypeMap] = await Promise.all([
+      stayntouchGet(`/reservations?hotel_id=${STAYNTOUCH_HOTEL_ID}&status=CHECKEDIN`),
+      stayntouchGet(`/reservations?hotel_id=${STAYNTOUCH_HOTEL_ID}&status=RESERVED`),
+      getRoomTypeMap(),
+    ]);
+
+    const checkedIn = (checkedInData.results || []);
+    const reserved  = (reservedData.results  || []);
+
+    // Dedupe by id — defensive; a reservation shouldn't sit in both buckets,
+    // but same-day arrival+departure edge cases exist.
+    const seen = new Set();
+    const union = [...checkedIn, ...reserved].filter(r => {
+      if (seen.has(r.id)) return false;
+      seen.add(r.id);
+      return true;
+    });
+
+    const reservations = union.map(r => mapReservationSummary(r, today, roomTypeMap));
+
+    console.log(`[StayNTouch] Active reservations: ${checkedIn.length} checked-in + ${reserved.length} reserved = ${reservations.length} unique`);
+
+    res.json({
+      reservations,
+      counts: { checkedin: checkedIn.length, reserved: reserved.length, total: reservations.length },
+      as_of: today,
+    });
+  } catch (e) {
+    console.error("[StayNTouch] /reservations/active error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // GET /stayntouch/reservations/:id — full reservation detail, passed through raw
 sntRouter.get("/reservations/:id", async (req, res) => {
   try {
