@@ -345,6 +345,7 @@ const detailCache = new Map();  // id -> { updatedTime, body, cachedAt }
 const NOTE_NOISE_PATTERNS = [
   /^way confirmation code/i,               // Way / experience-booking stub (pre-existing)
   /^deposit\/guarantee from siteminder/i,  // SiteMinder channel-manager deposit stub
+  /^addon from siteminder/i,               // SiteMinder channel-manager add-on stub
   /^payment gateway error/i,               // payment-processor system error line
 ];
 
