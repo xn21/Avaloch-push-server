@@ -449,6 +449,19 @@ function mapReservationSummary(r, today, roomTypeMap = {}) {
     segment_code:        r.segment_code     || null,
     creator_login:       r.creator?.login   || null,
     source_code:         r.source_code      || null,
+    // Booking provenance + timestamps, passed through from the SNT list row
+    // (confirmed present on the raw list payload, not detail-only). notes above
+    // already carries the cleaned guest/staff notes (list == detail, verified).
+    // TIMEZONE: created_time / updated_time are UTC-naive ISO strings (no offset)
+    // whose wall-clock is UTC — a consumer MUST difference them against UTC now
+    // (Date.now() / new Date().toISOString()), NOT against Eastern. Evidence
+    // (2026-07-18): the freshest updated_time across the active union was
+    // 2026-07-18T18:44:06, ~33 min before the 19:17 UTC observation; reading it
+    // as ET would place it ~3.5h in the future, which is impossible.
+    created_time:         r.created_time         || null,
+    updated_time:         r.updated_time         || null,
+    creator:             r.creator              || null,
+    booking_origin_code: r.booking_origin_code  || null,
   };
 }
 
