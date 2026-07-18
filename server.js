@@ -313,6 +313,26 @@ async function getRoomTypeMap() {
   }
 }
 
+// ── Reservation caches (shared, in-memory, no external deps) ─────────────────
+//
+// SNT flagged polling as too heavy; these caches keep total SNT reservation
+// traffic to low dozens of calls/day regardless of how many staff have the
+// page open or how often they refresh. Shared across ALL clients (module
+// scope), so the Nth staff member's refresh within the window costs zero SNT
+// calls. There is NO force-bypass on these routes by design.
+//
+//   activeUnionCache — one shared /reservations/active response, 15-min TTL.
+//     Within the TTL the route serves this and does not touch SNT.
+//   detailCache      — per-reservation detail keyed by id, storing the row's
+//     updated_time so a caller that knows the current updated_time (via
+//     ?updated_time=) forces a refetch only when it actually changed. A hard
+//     15-min TTL floor caps staleness regardless of hints (protects the
+//     existing modal consumers); day-rollover eviction is a further backstop.
+const ACTIVE_UNION_TTL_MS = 15 * 60 * 1000;
+const DETAIL_TTL_MS = 15 * 60 * 1000;
+let activeUnionCache = { body: null, cachedAt: 0 };
+const detailCache = new Map();  // id -> { updatedTime, body, cachedAt }
+
 // ── Shared Mapping Helper ─────────────────────────────────────────────────────
 
 // Resolve the most specific room_type_id we can for a reservation:
@@ -638,6 +658,16 @@ sntRouter.get("/reservations/search", async (req, res) => {
 // room_type_code.
 sntRouter.get("/reservations/active", async (req, res) => {
   try {
+    const now = Date.now();
+
+    // Interval guard: within the TTL, serve the ONE shared cached response and
+    // do NOT hit SNT — regardless of who calls or how often. No force bypass.
+    if (activeUnionCache.body && now - activeUnionCache.cachedAt < ACTIVE_UNION_TTL_MS) {
+      console.log(`[cache] active-union HIT (age ${Math.round((now - activeUnionCache.cachedAt) / 1000)}s) — no SNT call`);
+      return res.json(activeUnionCache.body);
+    }
+    console.log("[cache] active-union MISS — fetching from SNT");
+
     const today = new Date().toISOString().slice(0, 10);
 
     // Paginate BOTH status buckets to total_count (per_page=50) so the union is
@@ -662,11 +692,14 @@ sntRouter.get("/reservations/active", async (req, res) => {
 
     console.log(`[StayNTouch] Active reservations: ${checkedIn.length} checked-in + ${reserved.length} reserved = ${reservations.length} unique`);
 
-    res.json({
+    const body = {
       reservations,
       counts: { checkedin: checkedIn.length, reserved: reserved.length, total: reservations.length },
       as_of: today,
-    });
+      cached_at: new Date(now).toISOString(),
+    };
+    activeUnionCache = { body, cachedAt: now };
+    res.json(body);
   } catch (e) {
     console.error("[StayNTouch] /reservations/active error:", e.message);
     res.status(500).json({ error: e.message });
@@ -680,6 +713,37 @@ sntRouter.get("/reservations/:id", async (req, res) => {
     if (!/^\d+$/.test(id)) {
       return res.status(400).json({ error: "Invalid reservation id" });
     }
+
+    const now = Date.now();
+    const todayStr = new Date(now).toISOString().slice(0, 10);
+
+    // Backstop eviction: drop any cached entry not from today (day rollover).
+    for (const [k, v] of detailCache) {
+      if (new Date(v.cachedAt).toISOString().slice(0, 10) !== todayStr) detailCache.delete(k);
+    }
+
+    // Serve cache only when the entry is within the 15-min TTL floor AND either
+    // the caller gave no updated_time hint or the hint matches what we cached.
+    // The TTL floor is a hard staleness cap (protects the existing modal); a
+    // differing hint is the primary invalidation signal once callers pass it.
+    // No force bypass otherwise.
+    const hintedUpdatedTime = (req.query.updated_time || "").trim() || null;
+    const cached = detailCache.get(id);
+    if (cached) {
+      const ageMs = now - cached.cachedAt;
+      const ageS = Math.round(ageMs / 1000);
+      if (ageMs >= DETAIL_TTL_MS) {
+        console.log(`[cache] detail ${id} MISS (ttl, age ${ageS}s) — fetching from SNT`);
+      } else if (hintedUpdatedTime && hintedUpdatedTime !== cached.updatedTime) {
+        console.log(`[cache] detail ${id} MISS (updated_time changed) — fetching from SNT`);
+      } else {
+        console.log(`[cache] detail ${id} HIT (age ${ageS}s) — no SNT call`);
+        return res.json(cached.body);
+      }
+    } else {
+      console.log(`[cache] detail ${id} MISS (cold) — fetching from SNT`);
+    }
+
     const [data, roomTypeMap] = await Promise.all([
       stayntouchGet(`/reservations/${id}?hotel_id=${STAYNTOUCH_HOTEL_ID}`),
       getRoomTypeMap(),
@@ -708,11 +772,14 @@ sntRouter.get("/reservations/:id", async (req, res) => {
       ? (roomTypeMap[String(detailRoomTypeId)] || null)
       : null;
 
-    res.json({
+    const body = {
       ...data,
       stay_dates:     filteredStayDates,
       room_type_code: detailRoomTypeCode,
-    });
+      cached_at:      new Date(now).toISOString(),
+    };
+    detailCache.set(id, { updatedTime: data.updated_time || null, body, cachedAt: now });
+    res.json(body);
   } catch (e) {
     console.error(`[StayNTouch] /reservations/${req.params.id} error:`, e.message);
     res.status(500).json({ error: e.message });
