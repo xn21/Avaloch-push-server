@@ -333,6 +333,27 @@ const DETAIL_TTL_MS = 15 * 60 * 1000;
 let activeUnionCache = { body: null, cachedAt: 0 };
 const detailCache = new Map();  // id -> { updatedTime, body, cachedAt }
 
+// ── Note cleaning ────────────────────────────────────────────────────────────
+//
+// SNT reservation notes[] mix guest-authored content with channel-manager and
+// payment-system stubs. These patterns drop the machine noise so only
+// guest/staff-authored notes survive. Anchored at the start of the note so a
+// real note that merely mentions one of these words mid-sentence is kept.
+// Evidence (2026-07-18 live sample): "Deposit/guarantee from Siteminder…" rode
+// nearly every reservation; "Payment Gateway Error: 100 : Deny" appeared on
+// failed-auth bookings; "Way confirmation code…" is the pre-existing Way stub.
+const NOTE_NOISE_PATTERNS = [
+  /^way confirmation code/i,               // Way / experience-booking stub (pre-existing)
+  /^deposit\/guarantee from siteminder/i,  // SiteMinder channel-manager deposit stub
+  /^payment gateway error/i,               // payment-processor system error line
+];
+
+function isNoiseNote(text) {
+  const t = (text || "").trim();
+  if (!t) return true;  // empty note carries nothing
+  return NOTE_NOISE_PATTERNS.some((rx) => rx.test(t));
+}
+
 // ── Shared Mapping Helper ─────────────────────────────────────────────────────
 
 // Resolve the most specific room_type_id we can for a reservation:
@@ -378,15 +399,16 @@ function mapReservationSummary(r, today, roomTypeMap = {}) {
   if (r.status === "CHECKEDIN" && r.departure_date >  today)  displayStatus = "CHECKEDIN";
   if (r.status === "RESERVED"  && r.arrival_date  === today)  displayStatus = "RESERVED";
 
-  // Clean notes — strip Way/experience booking noise
+  // Clean notes — strip channel-manager / payment-system noise (see
+  // NOTE_NOISE_PATTERNS), keeping only guest/staff-authored notes.
   let notes = null;
   if (r.notes && Array.isArray(r.notes)) {
     const clean = r.notes
       .map(n => n.description || n.text || "")
-      .filter(n => n && !n.startsWith("Way confirmation code"))
+      .filter(n => !isNoiseNote(n))
       .join(" | ");
     notes = clean || null;
-  } else if (typeof r.notes === "string" && r.notes && !r.notes.startsWith("Way confirmation code")) {
+  } else if (typeof r.notes === "string" && !isNoiseNote(r.notes)) {
     notes = r.notes;
   }
 
@@ -772,8 +794,16 @@ sntRouter.get("/reservations/:id", async (req, res) => {
       ? (roomTypeMap[String(detailRoomTypeId)] || null)
       : null;
 
+    // Strip channel-manager / payment-system note noise (see NOTE_NOISE_PATTERNS),
+    // keeping the array shape ({description, type}) so guest/staff notes stay
+    // structured for the caller.
+    const cleanedNotes = Array.isArray(data.notes)
+      ? data.notes.filter(n => !isNoiseNote(n && (n.description || n.text)))
+      : data.notes;
+
     const body = {
       ...data,
+      notes:          cleanedNotes,
       stay_dates:     filteredStayDates,
       room_type_code: detailRoomTypeCode,
       cached_at:      new Date(now).toISOString(),
