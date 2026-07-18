@@ -250,6 +250,32 @@ async function stayntouchGet(path) {
   return response.json();
 }
 
+// Fetch EVERY page of an SNT list endpoint. SNT paginates via page/per_page
+// (1-indexed, default 25, max 50) and returns total_count in the body; loop
+// until page*per_page covers total_count (or a page comes back empty). A page
+// guard caps the loop so a malformed total_count can never spin forever. This
+// mirrors the existing precedent in this file (ringcentralGetAllPages) and the
+// SNT loop in tools/snt-rc-contact-sync (break on `page * per_page >=
+// total_count`). `pathWithQuery` already carries its own query string, e.g.
+// "/reservations?hotel_id=630&status=RESERVED".
+async function stayntouchGetAllPages(pathWithQuery, { perPage = 50, maxPages = 100 } = {}) {
+  const sep = pathWithQuery.includes("?") ? "&" : "?";
+  const all = [];
+  let page = 1;
+  while (page <= maxPages) {
+    const body = await stayntouchGet(`${pathWithQuery}${sep}per_page=${perPage}&page=${page}`);
+    const rows = body.results || [];
+    all.push(...rows);
+    const total = typeof body.total_count === "number" ? body.total_count : all.length;
+    if (page * perPage >= total || rows.length === 0) break;
+    page += 1;
+  }
+  if (page > maxPages) {
+    console.warn(`[StayNTouch] pagination guard hit (maxPages=${maxPages}) for ${pathWithQuery} — possible truncation`);
+  }
+  return all;
+}
+
 // ── Room-type catalog cache ───────────────────────────────────────────────────
 //
 // SNT identifies room types by numeric IDs in /reservations and /rooms responses.
@@ -614,17 +640,17 @@ sntRouter.get("/reservations/active", async (req, res) => {
   try {
     const today = new Date().toISOString().slice(0, 10);
 
-    const [checkedInData, reservedData, roomTypeMap] = await Promise.all([
-      stayntouchGet(`/reservations?hotel_id=${STAYNTOUCH_HOTEL_ID}&status=CHECKEDIN`),
-      stayntouchGet(`/reservations?hotel_id=${STAYNTOUCH_HOTEL_ID}&status=RESERVED`),
+    // Paginate BOTH status buckets to total_count (per_page=50) so the union is
+    // the FULL active set, not SNT's default first page. Dedup stays id-only.
+    const [checkedIn, reserved, roomTypeMap] = await Promise.all([
+      stayntouchGetAllPages(`/reservations?hotel_id=${STAYNTOUCH_HOTEL_ID}&status=CHECKEDIN`),
+      stayntouchGetAllPages(`/reservations?hotel_id=${STAYNTOUCH_HOTEL_ID}&status=RESERVED`),
       getRoomTypeMap(),
     ]);
 
-    const checkedIn = (checkedInData.results || []);
-    const reserved  = (reservedData.results  || []);
-
     // Dedupe by id — defensive; a reservation shouldn't sit in both buckets,
-    // but same-day arrival+departure edge cases exist.
+    // but same-day arrival+departure edge cases exist. NEVER dedupe by guest:
+    // two distinct confirm_nos for one guest are two real rooms.
     const seen = new Set();
     const union = [...checkedIn, ...reserved].filter(r => {
       if (seen.has(r.id)) return false;
